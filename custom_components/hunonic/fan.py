@@ -96,7 +96,14 @@ async def async_setup_entry(
         # không dùng trong HA Settings → Entities.
         if rt in IR_FAN_REMOTE_TYPES:
             name = str(device.get("name", "")).upper()
-            if "QUẠT" in name or "FAN" in name:
+            rem = device.get("remote")
+            is_fan = ("QUẠT" in name or "FAN" in name)
+            if not is_fan and isinstance(rem, list):
+                is_fan = any(
+                    isinstance(r, dict) and r.get("key_button") in ("wind", "shake", "speed")
+                    for r in rem
+                )
+            if is_fan:
                 return [HunonicIRFan(coordinator, device)]
         return []
 
@@ -301,6 +308,21 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
         self._oscillating: bool = False     # Quay / đảo gió
         self._preset_mode: str = PRESET_NORMAL
 
+        # Trích xuất mã phím học lệnh từ remote nếu có (Quạt T4)
+        self._button_codes: dict[str, str] = {}
+        rem = self._device.get("remote")
+        if isinstance(rem, dict):
+            for k, v in rem.items():
+                if isinstance(v, str) and len(v) > 20:
+                    self._button_codes[k] = v
+        elif isinstance(rem, list):
+            for item in rem:
+                if isinstance(item, dict):
+                    k = item.get("key_button") or item.get("key_name") or item.get("key")
+                    v = item.get("key_value") or item.get("value")
+                    if k and isinstance(v, str) and len(v) > 20:
+                        self._button_codes[k] = v
+
     async def async_added_to_hass(self) -> None:
         """Khôi phục trạng thái lần trước từ HA."""
         await super().async_added_to_hass()
@@ -396,20 +418,22 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
             speed = max(1, min(8, int(round(percentage * 8 / 100))))
             self._speed = speed
             action = _IR_SPEED_TO_ACTION.get(speed, IR_FAN_BTN_ON)
+            await self._send_cmd(action, "speed")
         elif preset_mode == PRESET_NATURAL:
             self._preset_mode = PRESET_NATURAL
             action = IR_FAN_BTN_NATURAL
+            await self._send_cmd(action, "wind")
         else:
             action = _IR_SPEED_TO_ACTION.get(self._speed, IR_FAN_BTN_ON)
+            await self._send_cmd(action, "powerOn")
 
         self._is_on = True
-        await self._send_cmd(action)
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Tắt quạt IR (gửi nút đỏ action=3)."""
+        """Tắt quạt IR."""
         self._is_on = False
-        await self._send_cmd(IR_FAN_BTN_OFF)
+        await self._send_cmd(IR_FAN_BTN_OFF, "powerOff")
         self.async_write_ha_state()
 
     async def async_set_percentage(self, percentage: int) -> None:
@@ -422,35 +446,50 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
         self._speed = speed
         self._is_on = True
         action = _IR_SPEED_TO_ACTION.get(speed, IR_FAN_BTN_SPD1)
-        await self._send_cmd(action)
+        await self._send_cmd(action, "speed")
         self.async_write_ha_state()
 
     async def async_oscillate(self, oscillating: bool) -> None:
-        """Bật/tắt quay (gửi nút quay action=5)."""
+        """Bật/tắt quay (gửi nút quay)."""
         self._oscillating = oscillating
-        await self._send_cmd(IR_FAN_BTN_SWING)
+        await self._send_cmd(IR_FAN_BTN_SWING, "shake")
         self.async_write_ha_state()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Đặt chế độ gió (Normal / Natural)."""
         self._preset_mode = preset_mode
         if preset_mode == PRESET_NATURAL:
-            await self._send_cmd(IR_FAN_BTN_NATURAL)
+            await self._send_cmd(IR_FAN_BTN_NATURAL, "wind")
         else:
-            # Quay lại tốc độ bình thường
             action = _IR_SPEED_TO_ACTION.get(self._speed, IR_FAN_BTN_SPD1)
-            await self._send_cmd(action)
+            await self._send_cmd(action, "speed")
         self.async_write_ha_state()
 
-    async def _send_cmd(self, action: int) -> None:
+    async def _send_cmd(self, action: int, btn_key: str | None = None) -> None:
         """Gửi payload điều khiển IR tới thiết bị qua MQTT."""
-        payload: dict[str, Any] = {
-            "u": int(self.coordinator._user_id or 0),
-            self._root_type: 0,
-            "act_id": 0,
-            "action": action,
-            "src": 1,
-        }
+        code = self._button_codes.get(btn_key) if btn_key else None
+        if not code and btn_key == "powerOn":
+            code = self._button_codes.get("powerOff") or self._button_codes.get("power")
+        if not code and btn_key == "powerOff":
+            code = self._button_codes.get("powerOn") or self._button_codes.get("power")
+
+        if code:
+            payload: dict[str, Any] = {
+                "irwifiv2": 1,
+                "type": 2,
+                "data": code,
+                "u": int(self.coordinator._user_id or 0),
+            }
+        else:
+            payload = {
+                "u": int(self.coordinator._user_id or 0),
+                "irwifiv2": 1,
+                self._root_type: 0,
+                "act_id": 0,
+                "action": action,
+                "src": 1,
+            }
+
         dev_id = self._device.get("id")
         if dev_id:
             try:
