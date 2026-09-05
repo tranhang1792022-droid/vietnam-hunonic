@@ -14,7 +14,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, DOOR_TYPES, GATE_HUB_TYPES, GATE_TYPES, METER_TYPES
+from .const import DOMAIN, DOOR_TYPES, GATE_HUB_TYPES, GATE_TYPES, IR_AC_TYPES, METER_TYPES
 from .coordinator import HunonicCoordinator
 from .entity_setup import setup_entities
 
@@ -28,6 +28,9 @@ _COVER_TYPES = frozenset(GATE_HUB_TYPES + GATE_TYPES + DOOR_TYPES)
 
 # Root types công tơ điện
 _METER_TYPES = frozenset(METER_TYPES)
+
+# Root types điều hòa IR
+_IR_AC_TYPES = frozenset(IR_AC_TYPES)
 
 
 async def async_setup_entry(
@@ -53,6 +56,11 @@ async def async_setup_entry(
             ents.append(HunonicMeterEnergySensor(coordinator, device, prev=True))
             ents.append(HunonicMeterCostSensor(coordinator, device, prev=False))
             ents.append(HunonicMeterCostSensor(coordinator, device, prev=True))
+        # Sensor trạng thái điều hòa IR (chế độ, nhiệt độ đặt, tốc độ quạt).
+        if root_type in _IR_AC_TYPES:
+            ents.append(HunonicACModeSensor(coordinator, device))
+            ents.append(HunonicACTempSensor(coordinator, device))
+            ents.append(HunonicACFanSensor(coordinator, device))
         # Sensor chẩn đoán cấp THIẾT BỊ (chung mọi nút) — chỉ tạo 1 lần ở kênh 1.
         if str(device.get("index_in_root", "1")) == "1":
             ents.append(HunonicFirmwareSensor(coordinator, device))
@@ -61,6 +69,7 @@ async def async_setup_entry(
         return ents
 
     setup_entities(hass, entry, async_add_entities, _build)
+
 
 
 class _HunonicSensorBase(CoordinatorEntity[HunonicCoordinator], SensorEntity):
@@ -394,3 +403,139 @@ class HunonicOfflineNotifySensor(_HunonicDiagBase):
     def native_value(self) -> str:
         raw = self.coordinator.get_device_raw(self._device_id)
         return "Bật" if str(raw.get("notify_offline", "0")) == "1" else "Tắt"
+
+
+# ── Sensor điều hòa IR ────────────────────────────────────────────────────────
+
+_IR_MODE_LABELS: dict[int, str] = {
+    0: "Auto",
+    1: "Cool",
+    2: "Dry",
+    3: "Fan",
+    4: "Heat",
+}
+
+_IR_FAN_LABELS: dict[int, str] = {
+    0: "Auto",
+    1: "Min",
+    2: "Low",
+    3: "Medium",
+    4: "High",
+    5: "Max",
+}
+
+
+class _HunonicACBase(_HunonicDiagBase):
+    """Base sensor chẩn đoán cho điều hòa IR — đọc từ MQTT state realtime."""
+
+    def _ac_state(self) -> dict[str, Any]:
+        return self.coordinator.get_device_state(self._root_id)
+
+    def _ac_field(self, *keys: str) -> Any:
+        """Đọc field từ MQTT state trước, fallback REST value JSON."""
+        state = self._ac_state()
+        for k in keys:
+            v = state.get(k)
+            if v is not None:
+                return v
+        raw = self.coordinator.get_device_raw(self._device_id)
+        value = raw.get("value")
+        if isinstance(value, str):
+            try:
+                import json as _json
+                parsed = _json.loads(value)
+                if isinstance(parsed, dict):
+                    for k in keys:
+                        v = parsed.get(k)
+                        if v is not None:
+                            return v
+            except (ValueError, TypeError):
+                pass
+        return None
+
+
+class HunonicACModeSensor(_HunonicACBase):
+    """Chế độ hoạt động điều hòa IR (Cool / Heat / Dry / Fan / Auto)."""
+
+    _attr_icon = "mdi:air-conditioner"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(_IR_MODE_LABELS.values()) + ["Off"]
+
+    @property
+    def unique_id(self) -> str:
+        return f"hunonic_{self._device_id}_ac_mode"
+
+    @property
+    def name(self) -> str:
+        return f"{self._device.get('name', self._device_id)} - Chế độ"
+
+    @property
+    def native_value(self) -> str:
+        action = self._ac_field("action")
+        if action is not None:
+            try:
+                if int(action) == 2:
+                    return "Off"
+            except (TypeError, ValueError):
+                pass
+        mode = self._ac_field("mode")
+        if mode is not None:
+            try:
+                return _IR_MODE_LABELS.get(int(mode), str(mode))
+            except (TypeError, ValueError):
+                pass
+        return "unknown"
+
+
+class HunonicACTempSensor(_HunonicACBase):
+    """Nhiệt độ đặt (setpoint) của điều hòa IR (°C)."""
+
+    _attr_icon = "mdi:thermometer"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "°C"
+
+    @property
+    def unique_id(self) -> str:
+        return f"hunonic_{self._device_id}_ac_temp"
+
+    @property
+    def name(self) -> str:
+        return f"{self._device.get('name', self._device_id)} - Nhiệt độ đặt"
+
+    @property
+    def native_value(self) -> float | None:
+        t = self._ac_field("temp", "temperature", "set_temp")
+        if t is not None:
+            try:
+                return float(t)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+
+class HunonicACFanSensor(_HunonicACBase):
+    """Tốc độ quạt điều hòa IR (Auto / Min / Low / Medium / High / Max)."""
+
+    _attr_icon = "mdi:fan"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(_IR_FAN_LABELS.values())
+
+    @property
+    def unique_id(self) -> str:
+        return f"hunonic_{self._device_id}_ac_fan"
+
+    @property
+    def name(self) -> str:
+        return f"{self._device.get('name', self._device_id)} - Tốc độ quạt"
+
+    @property
+    def native_value(self) -> str:
+        fan = self._ac_field("fan", "fan_speed", "wind")
+        if fan is not None:
+            try:
+                return _IR_FAN_LABELS.get(int(fan), str(fan))
+            except (TypeError, ValueError):
+                pass
+        return "unknown"
+
