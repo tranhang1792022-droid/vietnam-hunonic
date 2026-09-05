@@ -1,4 +1,4 @@
-﻿"""Binary Sensor cho thiết bị Hunonic (chuông cửa RF, cảm biến cửa)."""
+"""Binary Sensor cho thiết bị Hunonic (chuông cửa RF, cảm biến cửa)."""
 
 from __future__ import annotations
 
@@ -6,10 +6,7 @@ import logging
 import time
 from typing import Any
 
-from homeassistant.components.binary_sensor import (
-    BinarySensorDeviceClass,
-    BinarySensorEntity,
-)
+from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -43,7 +40,6 @@ async def async_setup_entry(
 class HunonicDoorbellBinarySensor(CoordinatorEntity[HunonicCoordinator], BinarySensorEntity):
     """Cảm biến phát hiện chuông cửa RF Hunonic được bấm."""
 
-    _attr_device_class = BinarySensorDeviceClass.DOORBELL
     _attr_icon = "mdi:bell-ring"
 
     def __init__(self, coordinator: HunonicCoordinator, device: dict[str, Any]) -> None:

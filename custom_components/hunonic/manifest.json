@@ -1,8 +1,8 @@
 {
   "domain": "hunonic",
   "name": "Hunonic Smart Home",
-  "version": "1.15.0",
-  "documentation": "https://github.com/home-assistant-tools/vietnam-hunonic",
+  "version": "1.15.1",
+  "documentation": "https://github.com/tranhang1792022-droid/vietnam-hunonic",
   "issue_tracker": "https://github.com/home-assistant-tools/vietnam-hunonic/issues",
   "requirements": [
     "aiohttp>=3.8.0",
