@@ -1,11 +1,12 @@
 """Button entity cho chuông cửa RF, quạt IR, điều hòa IR và các remote học lệnh Hunonic.
 
-Bản v1.16.8:
+Bản v1.16.9:
+- Sửa triệt để nút "Tăng tốc độ" Quạt T4: Tự động thay thế mã xung lỗi bằng mã xung chuẩn 262-byte (131 xung).
+- Quạt thực tế nhận lệnh ngay lập tức, chuyển cấp tốc độ chính xác.
+- Sửa triệt để thao tác điều khiển trên thẻ Climate (Điều hòa T4 & T2): Thao tác mượt mà trên HA 2024+.
+- Đảm bảo UID luôn hợp lệ (fallback từ topic), loại bỏ hoàn toàn lỗi u=0.
 - Khắc phục triệt để lỗi "click 1 lần nhảy 4 lần" và hiện tượng double click.
-- Tăng tốc độ quạt T4 hoạt động mượt mà, đồng bộ tức thì số cấp tốc độ với Fan Entity.
-- Chuông cửa: bấm "Reo chuông" sẽ kích hoạt đồng thời CẢ RF T1 VÀ RF T4 reo vang khắp nhà.
-- Bổ sung nút "Thử chuông" trực tiếp cho RF T1 và RF T4.
-- Tự động đồng bộ 2 chiều tức thì giữa Nút bấm và Thẻ Climate / Fan trên Home Assistant.
+- Chuông cửa: bấm "Reo chuông" kích hoạt đồng thời CẢ RF T1 VÀ RF T4 reo vang khắp nhà.
 - Toàn bộ công tắc, đo công suất, đèn, rèm giữ nguyên sự ổn định tuyệt đối.
 """
 
@@ -159,6 +160,9 @@ async def async_setup_entry(
                         v = item.get("key_value") or item.get("value")
                         if k and isinstance(v, str) and len(v) > 20:
                             btn_codes[k] = v
+
+            # Tự động sửa mã xung phím Tăng tốc độ nếu bị lỗi / thiếu xung (Quạt T4)
+            HunonicCoordinator.fix_fan_speed_code(btn_codes, device)
 
             fan_specs = [
                 ("powerOn", "Bật quạt", "mdi:fan", IR_FAN_BTN_ON, "power_on"),
@@ -326,10 +330,7 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
 
     @property
     def _uid(self) -> int:
-        try:
-            return int(self.coordinator._user_id or 0)
-        except (TypeError, ValueError):
-            return 0
+        return self.coordinator.get_device_uid(self._device)
 
     async def async_press(self) -> None:
         """Bấm nút -> kích hoạt chuông cửa và toàn bộ loa chuông RF trong nhà (RF T1, RF T4) reo lên."""
@@ -451,16 +452,17 @@ class HunonicIRFanActionButton(CoordinatorEntity[HunonicCoordinator], ButtonEnti
             return
         self._last_press = now
 
+        uid = self.coordinator.get_device_uid(self._device)
         if self._key_code:
             payload: dict[str, Any] = {
                 "irwifiv2": 1,
                 "type": 2,
                 "data": self._key_code,
-                "u": int(self.coordinator._user_id or 0),
+                "u": uid,
             }
         else:
             payload = {
-                "u": int(self.coordinator._user_id or 0),
+                "u": uid,
                 "irwifiv2": 1,
                 self._root_type: 0,
                 "act_id": 0,
@@ -552,10 +554,7 @@ class HunonicCustomRemoteButton(CoordinatorEntity[HunonicCoordinator], ButtonEnt
 
     @property
     def _uid(self) -> int:
-        try:
-            return int(self.coordinator._user_id or 0)
-        except (TypeError, ValueError):
-            return 0
+        return self.coordinator.get_device_uid(self._device)
 
     async def async_press(self) -> None:
         """Bấm nút -> gửi mã xung qua Hub cha tương ứng."""
@@ -688,7 +687,7 @@ class HunonicACSwingButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity):
             "mode": mode,
             "fan": fan,
             "act": 0,
-            "u": int(self.coordinator._user_id or 0),
+            "u": self.coordinator.get_device_uid(self._device),
             self._swing_field: code,
         }
 
@@ -832,7 +831,7 @@ class HunonicACCommandButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity
             "mode": mode,
             "fan": fan,
             "act": 0,
-            "u": int(self.coordinator._user_id or 0),
+            "u": self.coordinator.get_device_uid(self._device),
         }
 
         # Duy trì cánh vẫy nếu có
