@@ -95,7 +95,9 @@ async def async_setup_entry(
         # Climate entity (điều hòa) được tạo riêng ở climate.py — user tắt loại
         # không dùng trong HA Settings → Entities.
         if rt in IR_FAN_REMOTE_TYPES:
-            return [HunonicIRFan(coordinator, device)]
+            name = str(device.get("name", "")).upper()
+            if "QUẠT" in name or "FAN" in name:
+                return [HunonicIRFan(coordinator, device)]
         return []
 
     setup_entities(hass, entry, async_add_entities, _build)
@@ -442,12 +444,18 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
 
     async def _send_cmd(self, action: int) -> None:
         """Gửi payload điều khiển IR tới thiết bị qua MQTT."""
-        payload = {
+        payload: dict[str, Any] = {
             "u": int(self.coordinator._user_id or 0),
             self._root_type: 0,
             "act_id": 0,
             "action": action,
             "src": 1,
         }
+        dev_id = self._device.get("id")
+        if dev_id:
+            try:
+                payload["child_id"] = int(dev_id)
+            except (ValueError, TypeError):
+                payload["child_id"] = dev_id
         await self.coordinator.async_control_device(self._device, payload)
 
