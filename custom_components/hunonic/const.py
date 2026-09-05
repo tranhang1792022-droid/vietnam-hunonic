@@ -36,7 +36,7 @@ CONF_TOKEN_ID = "token_id"
 CONF_USER_ID = "user_id"
 CONF_HOME_IDS = "home_ids"  # danh sách nhà được chọn (rỗng/không có = tất cả)
 
-PLATFORMS = ["switch", "cover", "fan", "light", "sensor", "select", "climate", "button", "binary_sensor"]
+PLATFORMS = ["switch", "cover", "fan", "light", "sensor", "select", "climate", "button"]
 
 # Thiết bị điều hòa IR (MQTT action điều khiển qua tín hiệu hồng ngoại).
 # irchildv2 = IR child device v2 (điều hòa Hunonic), irremote = remote IR tổng quát.
