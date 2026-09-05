@@ -36,9 +36,32 @@ _IR_AC_TYPES = frozenset(IR_AC_TYPES)
 _TH_TYPES = frozenset(t.lower() for t in TH_TYPES)
 
 
-def _is_th_sensor(root_type: str) -> bool:
-    rt = (root_type or "").lower().strip()
-    return rt in _TH_TYPES or "thswifi" in rt or "thsensor" in rt or "thwifi" in rt
+def _is_th_sensor(device: dict[str, Any]) -> bool:
+    """Kiểm tra thiết bị có phải là cảm biến nhiệt độ / độ ẩm (thswifi, ...)."""
+    candidates = [
+        str(device.get("root_type") or "").lower().strip(),
+        str(device.get("device_type") or "").lower().strip(),
+        str(device.get("dev_type") or "").lower().strip(),
+        str(device.get("type") or "").lower().strip(),
+        str(device.get("model") or "").lower().strip(),
+    ]
+    for c in candidates:
+        if c in _TH_TYPES or any(k in c for k in ("thswifi", "thwifi", "thsensor", "thwswifi", "sensortemp", "swth")):
+            return True
+
+    # Kiểm tra tên thiết bị
+    dev_name = str(device.get("name") or "").lower()
+    if any(k in dev_name for k in ("nhiệt độ", "độ ẩm", "cảm biến nhiệt", "cảm biến ẩm", "nhiet do", "do am")):
+        return True
+
+    # Kiểm tra category
+    cat = device.get("category")
+    if isinstance(cat, dict):
+        cat_name = str(cat.get("name_en") or cat.get("name") or "").lower()
+        if any(k in cat_name for k in ("temp", "th", "humid", "sensor")):
+            return True
+
+    return False
 
 
 async def async_setup_entry(
@@ -70,7 +93,7 @@ async def async_setup_entry(
             ents.append(HunonicACTempSensor(coordinator, device))
             ents.append(HunonicACFanSensor(coordinator, device))
         # Cảm biến nhiệt độ & độ ẩm (thswifi, thwifi, ...)
-        if _is_th_sensor(root_type):
+        if _is_th_sensor(device):
             ents.append(HunonicTemperatureSensor(coordinator, device))
             ents.append(HunonicHumiditySensor(coordinator, device))
             ents.append(HunonicBatterySensor(coordinator, device))
@@ -608,6 +631,20 @@ class _HunonicTHBase(_HunonicSensorBase):
                             val = self._try_parse_float(extra_data[k])
                             if val is not None:
                                 return val
+
+            # Kiểm tra 'meta' list (danh sách dict {"meta_key": ..., "value": ...})
+            for m in raw.get("meta", []) or []:
+                if isinstance(m, dict):
+                    mk = str(m.get("meta_key", "")).lower()
+                    if any(k in mk for k in keys):
+                        val = self._try_parse_float(m.get("value"))
+                        if val is not None:
+                            return val
+
+            # Kiểm tra trực tiếp 'value' nếu là số đơn (nhiệt độ)
+            val_direct = self._try_parse_float(val_field)
+            if val_direct is not None and len(keys) > 0 and keys[0] in ("temp", "temperature", "t"):
+                return val_direct
 
         return None
 
