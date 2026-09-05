@@ -115,11 +115,15 @@ class HunonicSwitch(CoordinatorEntity[HunonicCoordinator], SwitchEntity):
         return self.coordinator.is_device_online(self._device_id)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Bật đúng kênh này."""
+        """Bật đúng kênh này tức thì."""
+        self.coordinator.set_channel_state(self._root_id, self._index, True)
+        self.async_write_ha_state()
         await self.coordinator.async_control_device(self._device, self._cmd(True))
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Tắt đúng kênh này."""
+        """Tắt đúng kênh này tức thì."""
+        self.coordinator.set_channel_state(self._root_id, self._index, False)
+        self.async_write_ha_state()
         await self.coordinator.async_control_device(self._device, self._cmd(False))
 
     def _cmd(self, on: bool) -> dict[str, Any]:
