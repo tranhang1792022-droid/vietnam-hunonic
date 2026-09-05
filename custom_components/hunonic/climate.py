@@ -154,6 +154,116 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         # Nhớ chế độ cuối trước khi tắt (để bật lại đúng)
         self._last_hvac_mode: HVACMode = HVACMode.COOL
 
+        # Bảng mã mode & fan riêng cho từng thiết bị dựa theo remote profile từ Hunonic
+        self._hvac_to_mode: dict[HVACMode, int] = dict(_HVAC_TO_MODE)
+        self._mode_to_hvac: dict[int, HVACMode] = dict(_MODE_TO_HVAC)
+        self._fan_label_to_code: dict[str, int] = dict(_FAN_LABEL_TO_CODE)
+        self._fan_code_to_label: dict[int, str] = dict(_FAN_CODE_TO_LABEL)
+        self._parse_remote_profile()
+
+        # Khởi tạo trạng thái ban đầu từ REST value nếu có
+        rv = self._raw_value()
+        if rv:
+            p = rv.get("power")
+            if p is not None:
+                try:
+                    self._hvac_mode = HVACMode.COOL if int(p) == 1 else HVACMode.OFF
+                except (ValueError, TypeError):
+                    pass
+            t = rv.get("temp")
+            if t is not None:
+                try:
+                    self._target_temp = float(t)
+                except (ValueError, TypeError):
+                    pass
+            m = rv.get("mode")
+            if m is not None:
+                try:
+                    mapped_m = self._mode_to_hvac.get(int(m))
+                    if mapped_m:
+                        self._last_hvac_mode = mapped_m
+                        if self._hvac_mode != HVACMode.OFF:
+                            self._hvac_mode = mapped_m
+                except (ValueError, TypeError):
+                    pass
+            f = rv.get("fan")
+            if f is not None:
+                try:
+                    mapped_f = self._fan_code_to_label.get(int(f))
+                    if mapped_f:
+                        self._fan_mode = mapped_f
+                except (ValueError, TypeError):
+                    pass
+
+    def _parse_remote_profile(self) -> None:
+        """Đọc bảng mã mode/fan/temp từ remote profile của chính thiết bị (Daikin, Funiki...)."""
+        rem = self._device.get("remote")
+        if not rem or not isinstance(rem, list):
+            return
+
+        for item in rem:
+            if not isinstance(item, dict):
+                continue
+            k_name = str(item.get("key_name") or "").strip().lower()
+            k_val = str(item.get("key_value") or "").strip()
+
+            if k_name == "temp_min":
+                try:
+                    self._attr_min_temp = float(k_val)
+                except (ValueError, TypeError):
+                    pass
+            elif k_name == "temp_max":
+                try:
+                    self._attr_max_temp = float(k_val)
+                except (ValueError, TypeError):
+                    pass
+            elif k_name == "mode":
+                try:
+                    modes_list = json.loads(k_val)
+                    if isinstance(modes_list, list):
+                        for m in modes_list:
+                            m_name = str(m.get("name") or "").lower()
+                            m_code = m.get("code")
+                            if m_code is not None:
+                                c = int(m_code)
+                                if m_name == "cool":
+                                    self._hvac_to_mode[HVACMode.COOL] = c
+                                elif m_name == "heat":
+                                    self._hvac_to_mode[HVACMode.HEAT] = c
+                                elif m_name == "dry":
+                                    self._hvac_to_mode[HVACMode.DRY] = c
+                                elif m_name == "fan":
+                                    self._hvac_to_mode[HVACMode.FAN_ONLY] = c
+                                elif m_name == "auto":
+                                    self._hvac_to_mode[HVACMode.AUTO] = c
+                        self._mode_to_hvac = {v: k for k, v in self._hvac_to_mode.items()}
+                except Exception:
+                    pass
+            elif k_name == "fan":
+                try:
+                    fans_list = json.loads(k_val)
+                    if isinstance(fans_list, list):
+                        for f in fans_list:
+                            f_name = str(f.get("name") or "").lower()
+                            f_code = f.get("code")
+                            if f_code is not None:
+                                c = int(f_code)
+                                if f_name == "auto":
+                                    self._fan_label_to_code[FAN_AUTO] = c
+                                elif f_name == "min":
+                                    self._fan_label_to_code[FAN_MIN] = c
+                                elif f_name in ("low", "med_low"):
+                                    self._fan_label_to_code[FAN_LOW] = c
+                                elif f_name in ("med", "medium"):
+                                    self._fan_label_to_code[FAN_MEDIUM] = c
+                                elif f_name in ("high", "med_high"):
+                                    self._fan_label_to_code[FAN_HIGH] = c
+                                elif f_name == "max":
+                                    self._fan_label_to_code[FAN_MAX] = c
+                        self._fan_code_to_label = {v: k for k, v in self._fan_label_to_code.items()}
+                except Exception:
+                    pass
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def async_added_to_hass(self) -> None:
@@ -253,28 +363,28 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
 
     def _is_on_from_state(self) -> bool | None:
         """True=bật, False=tắt, None=không rõ (dùng trạng thái restore)."""
-        act = self._get_field("action")
+        act = self._get_field("action", "power")
         if act is not None:
             try:
                 a = int(act)
-                # action 1 = bật, 2 = tắt (Hunonic convention)
+                # action 1 / power 1 = bật, action 2 / power 0 = tắt
                 if a == 1:
                     return True
-                if a == 2:
+                if a in (0, 2):
                     return False
             except (TypeError, ValueError):
                 pass
         return None
 
     def _mode_from_state(self) -> HVACMode:
-        """Đọc HVACMode hiện tại từ MQTT/REST state."""
+        """Đọc HVACMode hiện tại từ MQTT/REST state theo map động của thiết bị."""
         on = self._is_on_from_state()
         if on is False:
             return HVACMode.OFF
         mode_raw = self._get_field("mode")
         if mode_raw is not None:
             try:
-                return _MODE_TO_HVAC.get(int(mode_raw), HVACMode.COOL)
+                return self._mode_to_hvac.get(int(mode_raw), HVACMode.COOL)
             except (TypeError, ValueError):
                 pass
         # Nếu có action=1 nhưng không có mode → cool mặc định
@@ -293,11 +403,11 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         return self._target_temp
 
     def _fan_from_state(self) -> str:
-        """Đọc fan mode từ MQTT/REST state."""
+        """Đọc fan mode từ MQTT/REST state theo map động của thiết bị."""
         f = self._get_field("fan", "fan_speed", "wind")
         if f is not None:
             try:
-                return _FAN_CODE_TO_LABEL.get(int(f), self._fan_mode)
+                return self._fan_code_to_label.get(int(f), self._fan_mode)
             except (TypeError, ValueError):
                 pass
         return self._fan_mode
@@ -344,11 +454,11 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         if hvac_mode == HVACMode.OFF:
             await self._send_off()
         else:
-            mode_code = _HVAC_TO_MODE[hvac_mode]
+            mode_code = self._hvac_to_mode.get(hvac_mode, IR_MODE_COOL)
             await self._send_on(
                 mode=mode_code,
                 temp=self._target_temp,
-                fan=_FAN_LABEL_TO_CODE.get(self._fan_mode, IR_FAN_AUTO),
+                fan=self._fan_label_to_code.get(self._fan_mode, IR_FAN_AUTO),
             )
             self._last_hvac_mode = hvac_mode
         self._hvac_mode = hvac_mode
@@ -379,9 +489,9 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         self.async_write_ha_state()
 
         await self._send_on(
-            mode=_HVAC_TO_MODE.get(hvac, IR_MODE_COOL),
+            mode=self._hvac_to_mode.get(hvac, IR_MODE_COOL),
             temp=self._target_temp,
-            fan=_FAN_LABEL_TO_CODE.get(self._fan_mode, IR_FAN_AUTO),
+            fan=self._fan_label_to_code.get(self._fan_mode, IR_FAN_AUTO),
         )
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
@@ -393,9 +503,9 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             return
         hvac = self._hvac_mode
         await self._send_on(
-            mode=_HVAC_TO_MODE.get(hvac, IR_MODE_COOL),
+            mode=self._hvac_to_mode.get(hvac, IR_MODE_COOL),
             temp=self._target_temp,
-            fan=_FAN_LABEL_TO_CODE.get(fan_mode, IR_FAN_AUTO),
+            fan=self._fan_label_to_code.get(fan_mode, IR_FAN_AUTO),
         )
         self.async_write_ha_state()
 
@@ -403,9 +513,9 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         """Bật điều hòa ở chế độ cuối sử dụng."""
         hvac = self._last_hvac_mode
         await self._send_on(
-            mode=_HVAC_TO_MODE.get(hvac, IR_MODE_COOL),
+            mode=self._hvac_to_mode.get(hvac, IR_MODE_COOL),
             temp=self._target_temp,
-            fan=_FAN_LABEL_TO_CODE.get(self._fan_mode, IR_FAN_AUTO),
+            fan=self._fan_label_to_code.get(self._fan_mode, IR_FAN_AUTO),
         )
         self._hvac_mode = hvac
         self.async_write_ha_state()
@@ -429,13 +539,14 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         """Gửi lệnh BẬT với chế độ, nhiệt độ, tốc độ quạt."""
         t_int = int(round(temp))
         self._target_temp = float(t_int)
-        self._fan_mode = _FAN_CODE_TO_LABEL.get(fan, self._fan_mode)
-        self._hvac_mode = _MODE_TO_HVAC.get(mode, HVACMode.COOL)
+        self._fan_mode = self._fan_code_to_label.get(fan, self._fan_mode)
+        self._hvac_mode = self._mode_to_hvac.get(mode, HVACMode.COOL)
         self._last_hvac_mode = self._hvac_mode
 
         # Cập nhật optimistic vào coordinator ngay lập tức
         st = {
             "action": 1,
+            "power": 1,
             "mode": mode,
             "temp": t_int,
             "fan": fan,
@@ -470,7 +581,7 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
     async def _send_off(self) -> None:
         """Gửi lệnh TẮT."""
         self._hvac_mode = HVACMode.OFF
-        st = {"action": 2}
+        st = {"action": 2, "power": 0}
         self.coordinator.update_device_state(self._device_id, st)
         self.coordinator.update_device_state(self._root_id, st)
 
