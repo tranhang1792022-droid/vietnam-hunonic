@@ -101,6 +101,25 @@ _ALL_HVAC_MODES = [
 
 # ── Setup entry ───────────────────────────────────────────────────────────────
 
+def _is_ac_device(device: dict[str, Any]) -> bool:
+    """Chỉ tạo Climate cho điều hòa thực thụ (AC). Không tạo cho quạt hay TV, đèn."""
+    cat = device.get("category")
+    if isinstance(cat, dict):
+        cat_name = str(cat.get("name_en") or cat.get("name") or "").upper()
+        cat_id = str(cat.get("id") or "")
+        if cat_name == "AC" or cat_id == "1":
+            return True
+        if cat_name in ("CUSTOM_USER", "CUSTOM_RF", "TV", "LIGHT", "FAN"):
+            return False
+
+    dev_name = str(device.get("name") or "").upper()
+    if any(k in dev_name for k in ("ĐIỀU HÒA", "ĐIỀU HOÀ", "DIEU HOA", "AIR CONDITION", "CLIMATE")):
+        if "QUẠT" not in dev_name and "FAN" not in dev_name and "TIVI" not in dev_name:
+            return True
+
+    return False
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -109,7 +128,7 @@ async def async_setup_entry(
     """Thiết lập climate entities IR (tự thêm thiết bị mới khi danh sách thay đổi)."""
 
     def _build(coordinator: HunonicCoordinator, device: dict[str, Any]):
-        if device.get("root_type") in IR_AC_TYPES:
+        if device.get("root_type") in IR_AC_TYPES and _is_ac_device(device):
             return [HunonicIRClimate(coordinator, device)]
         return []
 
@@ -564,6 +583,22 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             "fan": fan,
             "src": 1,
         }
+        # Đính kèm brand id (Daikin 14, Funiki 104...) và swing
+        b_info = self._device.get("brand")
+        if isinstance(b_info, dict) and b_info.get("id"):
+            try:
+                payload["brand"] = int(b_info["id"])
+            except (ValueError, TypeError):
+                payload["brand"] = b_info["id"]
+
+        for sw in ("swingv", "swingh"):
+            sw_val = self._get_field(sw)
+            if sw_val is not None:
+                try:
+                    payload[sw] = int(sw_val)
+                except (ValueError, TypeError):
+                    pass
+
         dev_id = self._device.get("id")
         if dev_id:
             try:
