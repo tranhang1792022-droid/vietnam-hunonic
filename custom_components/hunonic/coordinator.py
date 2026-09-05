@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import struct
 import time
 import uuid
 from datetime import timedelta
@@ -76,6 +77,13 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Nhà được chọn (checkbox). Rỗng = nạp TẤT CẢ nhà của tài khoản.
         self._home_ids = [str(x) for x in (entry_data.get(CONF_HOME_IDS) or [])]
         self._user_id = str(entry_data.get(CONF_USER_ID, ""))
+        if not self._user_id and entry_data.get("devices"):
+            for d in entry_data.get("devices", []):
+                ts = str(d.get("topicsub") or d.get("topicpub") or "")
+                parts = ts.split("/")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    self._user_id = parts[1]
+                    break
         # Lưu credential để tự đăng nhập lại khi token_id hết hạn.
         self._phone = str(entry_data.get(CONF_PHONE, ""))
         self._password = str(entry_data.get(CONF_PASSWORD, ""))
@@ -158,6 +166,16 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._topic_index = {
             d["topicpub"]: d for d in devices if d.get("topicpub")
         }
+
+        # Tự động trích xuất user_id từ danh sách thiết bị nếu chưa có
+        if not self._user_id and devices:
+            for d in devices:
+                ts = str(d.get("topicsub") or d.get("topicpub") or "")
+                parts = ts.split("/")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    self._user_id = parts[1]
+                    _LOGGER.info("Hunonic: Tự động nhận diện user_id từ thiết bị: %s", self._user_id)
+                    break
 
         # Thiết bị OFFLINE (state=2) → xóa channel_state MQTT cũ. Khi online lại,
         # is_on dùng ngay `value` REST tươi (đúng trạng thái thật) thay vì giá trị
@@ -597,6 +615,14 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if hub_rid and hub_rid.lower() != "none":
                     root_id = hub_rid
 
+        # Luôn đảm bảo user ID (u) hợp lệ, không bao giờ gửi u: 0
+        if "u" in payload and (payload["u"] == 0 or not payload["u"]):
+            payload["u"] = self.get_device_uid(device)
+        elif "u" not in payload:
+            uid = self.get_device_uid(device)
+            if uid > 0:
+                payload["u"] = uid
+
         # Sắp xếp danh sách client: ưu tiên broker được gán cho thiết bị, tiếp theo là các broker khác
         candidate_clients: list[paho.Client] = []
         brokers = self._device_brokers.get(self._topic_root(topic), []) if topic else []
@@ -827,6 +853,110 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if did not in self._device_state:
             self._device_state[did] = {}
         self._device_state[did].update(new_state)
+
+    def get_device_uid(self, device: dict[str, Any] | None = None) -> int:
+        """Lấy user ID chuẩn xác, tự động fallback từ topic của thiết bị nếu user_id chưa nạp."""
+        try:
+            uid = int(self._user_id or 0)
+            if uid > 0:
+                return uid
+        except (TypeError, ValueError):
+            pass
+
+        if device:
+            for k in ("owner_id", "user_id", "owner"):
+                val = device.get(k)
+                if val and str(val).isdigit() and int(val) > 0:
+                    return int(val)
+            ts = str(
+                device.get("topicsub")
+                or device.get("topicpub")
+                or device.get("topic_sub")
+                or device.get("topic_pub")
+                or ""
+            )
+            parts = ts.split("/")
+            if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > 0:
+                return int(parts[1])
+
+        # Quét tất cả thiết bị đã nạp trong data
+        for d in (self.data or {}).get("devices", []):
+            ts = str(d.get("topicsub") or d.get("topicpub") or "")
+            parts = ts.split("/")
+            if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > 0:
+                self._user_id = parts[1]
+                return int(parts[1])
+
+        return 0
+
+    @staticmethod
+    def fix_fan_speed_code(btn_codes: dict[str, str], device: dict[str, Any] | None = None) -> None:
+        """Sửa mã phím 'speed' (Tăng tốc độ) bị lỗi/thiếu xung trên Quạt T4 và quạt học lệnh IR."""
+        dev_id = str(device.get("id") or "") if device else ""
+        dev_name = str(device.get("name") or "").upper() if device else ""
+
+        # 1. Quạt T4 cụ thể: nạp trực tiếp mã xung chuẩn 262-byte (131 pulses, cmd 0x05, chk 0xD0)
+        # Mã này đã được giải mã và kiểm tra chuẩn khớp tuyệt đối với Quạt T4
+        quat_t4_speed_code = (
+            "mgzYBaQBcATGAWoEigHgAYYB5AGQAdABjAGmBKoBvgGwAcYBnAGMBKQBjgRoAQAC"
+            "gAGyBIgB3AGMAdwBjgGOBJ4BmgR+AeABiAGuBIQBlASiAcIBpgGSBHwB6AGAAeYB"
+            "hgHgAYgB4AGIAeABggG0BIAB5AGCAeIBigHcAYoBkgScAcwBnAHMAZwB5gGCAegB"
+            "hAHeAYoB3gGKAd4BhAHmAYIBlgSCAbAEgAHoAYAB9AGWAZAEggHgAYYB4AGGAeYB"
+            "hgGSBGgBsARoAfQBaAGwBGgB9AFoAfQBaAH0AWgB9AFoAfQBaAH0AWgB9AFoAfQB"
+            "aAH0AWgBsARoAfQBaAGwBGgBsARoAQ=="
+        )
+        if dev_id == "3626230" or ("QUẠT" in dev_name and "T4" in dev_name):
+            btn_codes["speed"] = quat_t4_speed_code
+            return
+
+        # 2. Thuật toán tổng quát tự động sửa cho mọi quạt học lệnh khác nếu phím speed bị lỗi capture
+        speed_code = btn_codes.get("speed")
+        ref_code = (
+            btn_codes.get("powerOn")
+            or btn_codes.get("powerOff")
+            or btn_codes.get("wind")
+            or btn_codes.get("shake")
+        )
+        if not ref_code:
+            return
+
+        try:
+            raw_ref = base64.b64decode(ref_code)
+            if len(raw_ref) < 100:
+                return
+
+            need_fix = False
+            if not speed_code:
+                need_fix = True
+            else:
+                raw_speed = base64.b64decode(speed_code)
+                if abs(len(raw_speed) - len(raw_ref)) > 30 or len(raw_speed) < 100:
+                    need_fix = True
+
+            if need_fix:
+                words = list(
+                    struct.unpack(
+                        f"<{len(raw_ref)//2}H",
+                        raw_ref[: len(raw_ref) - len(raw_ref) % 2],
+                    )
+                )
+                if len(words) >= 98:
+                    new_pulses = list(words[:98])
+                    # Byte 6: Command 0x05 (Speed)
+                    for i in range(8):
+                        new_pulses.append(360)
+                        new_pulses.append(1200 if ((0x05 >> i) & 1) == 1 else 500)
+                    # Byte 7: Checksum 0xD0 (0x80 + 0x05 * 0x10)
+                    for i in range(8):
+                        new_pulses.append(360)
+                        new_pulses.append(1200 if ((0xD0 >> i) & 1) == 1 else 500)
+                    new_pulses.append(360)
+
+                    packed = struct.pack(f"<{len(new_pulses)}H", *new_pulses)
+                    btn_codes["speed"] = base64.b64encode(packed).decode("ascii")
+                    _LOGGER.info("Hunonic: Đã tổng hợp thành công mã xung chuẩn cho phím Tăng tốc độ quạt IR")
+        except Exception as ex:
+            _LOGGER.debug("Hunonic: Không thể tổng hợp mã speed: %s", ex)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
