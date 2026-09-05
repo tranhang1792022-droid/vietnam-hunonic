@@ -458,44 +458,24 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
 
     def _record_channel_state(self, root_id: str, payload: dict[str, Any]) -> None:
-        """Cập nhật trạng thái TỪNG KÊNH từ `action`, `turn`, `status`, `power`."""
-        rid = str(root_id)
-        has_act = False
+        """Cập nhật trạng thái TỪNG KÊNH từ `action`: kênh=(a+1)//2, ON nếu a lẻ.
+
+        Cần cho công tắc đa nút (chung root_id): nếu chỉ lưu 1 action chung, kênh
+        không khớp sẽ đọc nhầm → 'tắt nút này nút kia bật'.
+        """
         act = payload.get("action")
-        if act is not None:
-            try:
-                a = int(act)
-                if a >= 1:
-                    self._channel_state.setdefault(rid, {})[(a + 1) // 2] = (a % 2 == 1)
-                    has_act = True
-            except (TypeError, ValueError):
-                pass
-
-        if not has_act:
-            turn = payload.get("turn")
-            if turn is not None:
-                try:
-                    t = int(turn)
-                    self._channel_state.setdefault(rid, {})[1] = (t == 1)
-                except (TypeError, ValueError):
-                    pass
-
-            for p_key in ("power", "status", "sw1"):
-                p_val = payload.get(p_key)
-                if p_val is not None:
-                    try:
-                        pv = int(p_val)
-                        self._channel_state.setdefault(rid, {})[1] = (pv == 1)
-                    except (TypeError, ValueError):
-                        pass
+        if act is None:
+            return
+        try:
+            a = int(act)
+        except (TypeError, ValueError):
+            return
+        if a >= 1:
+            self._channel_state.setdefault(root_id, {})[(a + 1) // 2] = (a % 2 == 1)
 
     def get_channel_state(self, root_id: str, channel: int) -> bool | None:
         """Trạng thái ON/OFF của 1 kênh (1-based); None nếu chưa biết."""
-        return self._channel_state.get(str(root_id), {}).get(channel)
-
-    def set_channel_state(self, root_id: str, channel: int, is_on: bool) -> None:
-        """Cập nhật optimistic trạng thái bật/tắt của 1 kênh."""
-        self._channel_state.setdefault(str(root_id), {})[channel] = is_on
+        return self._channel_state.get(root_id, {}).get(channel)
 
     # ── Control ──────────────────────────────────────────────────────────────
 
@@ -578,17 +558,7 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     except (ValueError, TypeError):
                         payload.setdefault("child_id", device.get("id"))
 
-        # Thiết bị con RF (rfchild / rfdb): phát tín hiệu qua bộ phát hsrf
-        if root_type in ("rfchild", "rfdb") or str(device.get("type", "")).lower() == "rfchild":
-            payload["hsrf"] = 0
-            payload.setdefault("rfchild", 0)
-            if device.get("id"):
-                try:
-                    payload.setdefault("child_id", int(device.get("id")))
-                except (ValueError, TypeError):
-                    payload.setdefault("child_id", device.get("id"))
-
-        # Publish lên broker của thiết bị VÀ tất cả client MQTT đang kết nối
+        # Publish lên tất cả broker khả dụng (cả broker thiết bị và toàn bộ client đang nối)
         brokers = self._device_brokers.get(self._topic_root(topic), []) if topic else []
         target_clients = [
             self._mqtt_clients[b]
@@ -596,6 +566,7 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if b in self._mqtt_clients and self._mqtt_clients[b].is_connected()
         ]
         all_connected = [c for c in self._mqtt_clients.values() if c.is_connected()]
+        # Gom deduplicate tất cả broker
         clients = list({id(c): c for c in (target_clients + all_connected)}.values())
 
         if clients and topic:
@@ -638,6 +609,11 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._device_state.setdefault(rid_target, {}).update(payload)
                     self._record_channel_state(rid_target, payload)
                 self.async_set_updated_data(self.data)
+                # Lên lịch refresh sau 2s để đồng bộ trạng thái thật
+                self.hass.loop.call_later(
+                    2,
+                    lambda: self.hass.async_create_task(self.async_request_refresh()),
+                )
                 return True
 
             _LOGGER.warning("MQTT publish thất bại cho %s", device.get("name"))
@@ -673,65 +649,37 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._device_index.get(str(device_id), {})
 
     def find_parent_irwifi(self, device: dict[str, Any]) -> dict[str, Any] | None:
-        """Tìm bộ phát hồng ngoại irwifiv2 quản lý thiết bị con irchildv2 chuẩn xác."""
+        """Tìm bộ phát hồng ngoại irwifiv2 quản lý thiết bị con irchildv2."""
+        root_id = str(device.get("root_id", ""))
+        home_id = str(device.get("home_id", ""))
         devices = (self.data or {}).get("devices", [])
-        if not devices:
-            return None
 
-        # 1. Kiểm tra trường liên kết trực tiếp irchild_root_id (chuẩn từ app Hunonic)
-        ir_root_val = ""
-        raw_irchild_root = device.get("irchild_root_id")
-        if isinstance(raw_irchild_root, dict):
-            ir_root_val = str(raw_irchild_root.get("value") or "").strip()
-        elif raw_irchild_root:
-            ir_root_val = str(raw_irchild_root).strip()
-
-        if not ir_root_val:
-            # Tìm trong mảng meta nếu có meta_key == 'irchild_root_id'
-            for m in device.get("meta", []):
-                if isinstance(m, dict) and m.get("meta_key") == "irchild_root_id":
-                    ir_root_val = str(m.get("value") or "").strip()
-                    break
-
-        if ir_root_val:
-            for d in devices:
-                if str(d.get("root_id", "")).strip() == ir_root_val or str(d.get("id", "")).strip() == ir_root_val:
-                    return d
-
-        # 2. Kiểm tra topic root của chính device (topicsub của irchildv2 thường trỏ thẳng tới irwifiv2)
-        dev_topicsub = str(device.get("topicsub") or device.get("topicpub") or "").strip()
-        if dev_topicsub:
-            sub_root = self._topic_root(dev_topicsub)
-            if sub_root:
-                for d in devices:
-                    if str(d.get("root_id", "")).strip() == sub_root:
-                        return d
-
-        # 3. Khớp theo tầng / phòng trong tên thiết bị (ví dụ: 'T4' -> 'IR T4', 'T2' -> 'IR T2')
-        dev_name = str(device.get("name") or "").upper()
-        for d in devices:
-            rt = str(d.get("root_type", "")).lower()
-            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
-                hub_name = str(d.get("name") or "").upper()
-                for floor in ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8"]:
-                    if floor in dev_name and floor in hub_name:
-                        return d
-
-        # 4. Kiểm tra parent_id, hub_id, gateway_id nếu có
+        # 0. Kiểm tra parent_id, hub_id, gateway_id nếu có
         parent_id = str(device.get("parent_id") or device.get("hub_id") or device.get("gateway_id") or "")
         if parent_id:
             for d in devices:
                 if str(d.get("id", "")) == parent_id or str(d.get("root_id", "")) == parent_id:
                     return d
 
-        # 5. Fallback cùng nhà CHỈ KHI chỉ có đúng 1 irwifiv2 trong nhà đó
-        home_id = str(device.get("home_id", ""))
-        ir_in_home = [
-            d for d in devices
-            if ("irwifi" in str(d.get("root_type", "")).lower()) and (not home_id or str(d.get("home_id", "")) == home_id)
-        ]
-        if len(ir_in_home) == 1:
-            return ir_in_home[0]
+        # 1. Tìm irwifiv2 có ID hoặc root_id trùng với root_id của irchildv2
+        for d in devices:
+            rt = str(d.get("root_type", "")).lower()
+            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
+                if root_id and (str(d.get("id", "")) == root_id or str(d.get("root_id", "")) == root_id):
+                    return d
+
+        # 2. Tìm irwifiv2 trong cùng nhà (home_id)
+        for d in devices:
+            rt = str(d.get("root_type", "")).lower()
+            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
+                if home_id and str(d.get("home_id", "")) == home_id:
+                    return d
+
+        # 3. Fallback: bất kỳ irwifiv2 nào có trong tài khoản
+        for d in devices:
+            rt = str(d.get("root_type", "")).lower()
+            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
+                return d
 
         return None
 
