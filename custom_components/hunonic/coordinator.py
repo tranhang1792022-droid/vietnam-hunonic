@@ -458,24 +458,40 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
 
     def _record_channel_state(self, root_id: str, payload: dict[str, Any]) -> None:
-        """Cập nhật trạng thái TỪNG KÊNH từ `action`: kênh=(a+1)//2, ON nếu a lẻ.
-
-        Cần cho công tắc đa nút (chung root_id): nếu chỉ lưu 1 action chung, kênh
-        không khớp sẽ đọc nhầm → 'tắt nút này nút kia bật'.
-        """
+        """Cập nhật trạng thái TỪNG KÊNH từ `action`, `turn`, `status`, `power`."""
         act = payload.get("action")
-        if act is None:
-            return
-        try:
-            a = int(act)
-        except (TypeError, ValueError):
-            return
-        if a >= 1:
-            self._channel_state.setdefault(root_id, {})[(a + 1) // 2] = (a % 2 == 1)
+        if act is not None:
+            try:
+                a = int(act)
+                if a >= 1:
+                    self._channel_state.setdefault(root_id, {})[(a + 1) // 2] = (a % 2 == 1)
+            except (TypeError, ValueError):
+                pass
+
+        turn = payload.get("turn")
+        if turn is not None:
+            try:
+                t = int(turn)
+                self._channel_state.setdefault(root_id, {})[1] = (t == 1)
+            except (TypeError, ValueError):
+                pass
+
+        for p_key in ("power", "status", "sw1"):
+            p_val = payload.get(p_key)
+            if p_val is not None:
+                try:
+                    pv = int(p_val)
+                    self._channel_state.setdefault(root_id, {})[1] = (pv == 1)
+                except (TypeError, ValueError):
+                    pass
 
     def get_channel_state(self, root_id: str, channel: int) -> bool | None:
         """Trạng thái ON/OFF của 1 kênh (1-based); None nếu chưa biết."""
         return self._channel_state.get(root_id, {}).get(channel)
+
+    def set_channel_state(self, root_id: str, channel: int, is_on: bool) -> None:
+        """Cập nhật optimistic trạng thái bật/tắt của 1 kênh."""
+        self._channel_state.setdefault(str(root_id), {})[channel] = is_on
 
     # ── Control ──────────────────────────────────────────────────────────────
 
@@ -558,16 +574,24 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     except (ValueError, TypeError):
                         payload.setdefault("child_id", device.get("id"))
 
-        # Publish lên tất cả broker khả dụng (cả broker thiết bị và toàn bộ client đang nối)
+        # Thiết bị con RF (rfchild / rfdb): phát tín hiệu qua bộ phát hsrf
+        if root_type in ("rfchild", "rfdb") or str(device.get("type", "")).lower() == "rfchild":
+            payload["hsrf"] = 0
+            payload.setdefault("rfchild", 0)
+            if device.get("id"):
+                try:
+                    payload.setdefault("child_id", int(device.get("id")))
+                except (ValueError, TypeError):
+                    payload.setdefault("child_id", device.get("id"))
+
+        # Publish lên broker của thiết bị (primary + backup), fallback các client đang nối
         brokers = self._device_brokers.get(self._topic_root(topic), []) if topic else []
         target_clients = [
             self._mqtt_clients[b]
             for b in brokers
             if b in self._mqtt_clients and self._mqtt_clients[b].is_connected()
         ]
-        all_connected = [c for c in self._mqtt_clients.values() if c.is_connected()]
-        # Gom deduplicate tất cả broker
-        clients = list({id(c): c for c in (target_clients + all_connected)}.values())
+        clients = target_clients or [c for c in self._mqtt_clients.values() if c.is_connected()]
 
         if clients and topic:
             raw_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -609,11 +633,6 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._device_state.setdefault(rid_target, {}).update(payload)
                     self._record_channel_state(rid_target, payload)
                 self.async_set_updated_data(self.data)
-                # Lên lịch refresh sau 2s để đồng bộ trạng thái thật
-                self.hass.loop.call_later(
-                    2,
-                    lambda: self.hass.async_create_task(self.async_request_refresh()),
-                )
                 return True
 
             _LOGGER.warning("MQTT publish thất bại cho %s", device.get("name"))
