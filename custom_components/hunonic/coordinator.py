@@ -546,7 +546,7 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Thiết bị con IR (irchildv2): phát tín hiệu qua bộ phát irwifiv2
         if root_type in ("irchildv2", "irremote"):
-            hub = self.find_parent_irwifi(device)
+            hub = self.find_parent_hub(device)
             if hub:
                 # Bắt buộc dùng topic và key/iv của irwifiv2 để irwifiv2 nhận và giải mã được
                 hub_topic = str(hub.get("topicsub") or hub.get("topic_sub") or "").strip()
@@ -565,13 +565,37 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 hub_rid = str(hub.get("root_id") or "").strip()
                 if hub_rid and hub_rid.lower() != "none":
                     root_id = hub_rid
-                payload["irwifiv2"] = 0
-                payload.setdefault("irchildv2", 0)
-                if device.get("id"):
-                    try:
-                        payload.setdefault("child_id", int(device.get("id")))
-                    except (ValueError, TypeError):
-                        payload.setdefault("child_id", device.get("id"))
+
+                # Hub irwifiv2 yêu cầu irwifiv2: 1 để thực thi phát lệnh IR
+                payload.setdefault("irwifiv2", 1)
+                if "type" not in payload:
+                    payload.setdefault("irchildv2", 0)
+                    if device.get("id"):
+                        try:
+                            payload.setdefault("child_id", int(device.get("id")))
+                        except (ValueError, TypeError):
+                            payload.setdefault("child_id", device.get("id"))
+
+        # Thiết bị con RF (rfchild / rfdb): giải mã bằng key/iv của hub trung tâm RF (hsrf)
+        if root_type in ("rfchild", "rfdb") or (topic and "hsrf" in topic):
+            hub = self.find_parent_hub(device)
+            if hub:
+                hub_topic = str(hub.get("topicsub") or hub.get("topic_sub") or "").strip()
+                if not hub_topic or hub_topic.lower() == "none":
+                    hub_pub = str(hub.get("topicpub") or hub.get("topic_pub") or "").strip()
+                    if hub_pub and hub_pub.lower() != "none":
+                        hub_topic = hub_pub[:-3] if hub_pub.endswith("/ok") else hub_pub
+                if hub_topic:
+                    topic = hub_topic
+                hk = str(hub.get("key") or "").strip()
+                if hk and hk.lower() != "none":
+                    key_b64 = hk
+                hi = str(hub.get("iv") or "").strip()
+                if hi and hi.lower() != "none":
+                    iv_b64 = hi
+                hub_rid = str(hub.get("root_id") or "").strip()
+                if hub_rid and hub_rid.lower() != "none":
+                    root_id = hub_rid
 
         # Publish lên tất cả broker khả dụng (cả broker thiết bị và toàn bộ client đang nối)
         brokers = self._device_brokers.get(self._topic_root(topic), []) if topic else []
@@ -599,6 +623,25 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except Exception as ex:
                     _LOGGER.warning("Decode Key/IV error for %s: %s", device.get("name"), ex)
                     valid_key_iv = False
+
+            # Fallback tra cứu key/iv từ hub trong topic nếu key hiện tại không hợp lệ
+            if not valid_key_iv and topic:
+                parts = topic.split("/")
+                if len(parts) >= 3:
+                    topic_hub_rid = parts[2]
+                    for d in (self.data or {}).get("devices", []):
+                        if str(d.get("root_id")) == topic_hub_rid and d.get("key") and d.get("iv"):
+                            try:
+                                kb = base64.b64decode(str(d.get("key")).strip())
+                                ib = base64.b64decode(str(d.get("iv")).strip())
+                                if len(kb) in (16, 24, 32) and len(ib) == 16:
+                                    key_b64 = str(d.get("key")).strip()
+                                    iv_b64 = str(d.get("iv")).strip()
+                                    root_id = topic_hub_rid
+                                    valid_key_iv = True
+                                    break
+                            except Exception:
+                                pass
 
             try:
                 # PHẢI publish CIPHERTEXT NHỊ PHÂN THÔ (KHÔNG base64) — thiết bị bỏ qua
@@ -666,52 +709,86 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Trả về dữ liệu raw từ REST API theo device_id."""
         return self._device_index.get(str(device_id), {})
 
-    def find_parent_irwifi(self, device: dict[str, Any]) -> dict[str, Any] | None:
-        """Tìm bộ phát hồng ngoại irwifiv2 quản lý thiết bị con irchildv2."""
-        root_id = str(device.get("root_id", ""))
-        home_id = str(device.get("home_id", ""))
+    def find_parent_hub(self, device: dict[str, Any]) -> dict[str, Any] | None:
+        """Tìm hub cha (irwifiv2 hoặc hsrf) quản lý thiết bị con IR hoặc RF."""
         devices = (self.data or {}).get("devices", [])
 
-        # 0. Kiểm tra parent_id, hub_id, gateway_id nếu có
-        parent_id = str(device.get("parent_id") or device.get("hub_id") or device.get("gateway_id") or "")
-        if parent_id:
+        # 1. Trích xuất parent root_id từ metadata (irchild_root_id, rfchild_root_id, parent_root_id)
+        meta = device.get("meta") or []
+        parent_rid = None
+        if isinstance(meta, list):
+            for m in meta:
+                if isinstance(m, dict) and m.get("meta_key") in (
+                    "irchild_root_id",
+                    "rfchild_root_id",
+                    "parent_root_id",
+                    "hub_root_id",
+                ):
+                    parent_rid = m.get("value")
+                    if parent_rid:
+                        break
+
+        # 2. Trích xuất parent root_id từ topicsub: u/{uid}/{parent_rid}/{ts}
+        if not parent_rid:
+            tsub = str(device.get("topicsub") or device.get("topic_sub") or "").strip()
+            parts = tsub.split("/")
+            if len(parts) >= 3 and parts[2] and parts[2].lower() != "none":
+                parent_rid = parts[2]
+
+        # 3. Trích xuất parent root_id từ parent_id, hub_id, gateway_id nếu có
+        if not parent_rid:
+            parent_rid = str(
+                device.get("parent_id")
+                or device.get("hub_id")
+                or device.get("gateway_id")
+                or ""
+            ).strip()
+
+        # Đối chiếu chính xác parent_rid với danh sách thiết bị
+        if parent_rid:
             for d in devices:
-                if str(d.get("id", "")) == parent_id or str(d.get("root_id", "")) == parent_id:
+                if str(d.get("root_id", "")).strip() == parent_rid or str(d.get("id", "")).strip() == parent_rid:
                     return d
 
-        # 1. Tìm irwifiv2 có ID hoặc root_id trùng với root_id của irchildv2
+        # 4. Fallback: tìm theo home_id và loại hub (IR hoặc RF)
+        root_type = str(device.get("root_type", "")).lower()
+        home_id = str(device.get("home_id", ""))
         for d in devices:
             rt = str(d.get("root_type", "")).lower()
-            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
-                if root_id and (str(d.get("id", "")) == root_id or str(d.get("root_id", "")) == root_id):
-                    return d
+            if any(k in root_type for k in ("ir", "irchild", "irremote")):
+                if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
+                    if home_id and str(d.get("home_id", "")) == home_id:
+                        return d
+            elif any(k in root_type for k in ("rf", "rfchild", "rfdb")):
+                if "hsrf" in rt or "rf" in rt:
+                    if home_id and str(d.get("home_id", "")) == home_id:
+                        return d
 
-        # 2. Tìm irwifiv2 trong cùng nhà (home_id)
+        # 5. Fallback cuối cùng
         for d in devices:
             rt = str(d.get("root_type", "")).lower()
-            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
-                if home_id and str(d.get("home_id", "")) == home_id:
-                    return d
-
-        # 3. Fallback: bất kỳ irwifiv2 nào có trong tài khoản
-        for d in devices:
-            rt = str(d.get("root_type", "")).lower()
-            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
+            if any(k in root_type for k in ("ir", "irchild", "irremote")) and ("irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub")):
+                return d
+            if any(k in root_type for k in ("rf", "rfchild", "rfdb")) and ("hsrf" in rt or "rf" in rt):
                 return d
 
         return None
 
+    def find_parent_irwifi(self, device: dict[str, Any]) -> dict[str, Any] | None:
+        """Tìm bộ phát hồng ngoại irwifiv2 quản lý thiết bị con irchildv2."""
+        return self.find_parent_hub(device)
+
     def is_device_online(self, device_id: str) -> bool:
         """Thiết bị có online không — dựa trên field `state` (1/2) ĐÁNG TIN.
 
-        Với thiết bị con IR (irchildv2): đồng bộ online theo bộ phát irwifiv2.
+        Với thiết bị con IR (irchildv2) và RF (rfchild/rfdb): đồng bộ online theo hub cha.
         """
         raw = self._device_index.get(str(device_id), {})
         root_type = str(raw.get("root_type", ""))
 
-        # irchildv2 đồng bộ online theo cục phát irwifiv2
-        if root_type in ("irchildv2", "irremote"):
-            hub = self.find_parent_irwifi(raw)
+        # Thiết bị con IR và RF đồng bộ online theo hub cha
+        if root_type in ("irchildv2", "irremote", "rfchild", "rfdb"):
+            hub = self.find_parent_hub(raw)
             if hub:
                 hub_state = str(hub.get("state", ""))
                 if hub_state == "1":
@@ -721,7 +798,7 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Nếu bản thân có state 1 -> online
             if str(raw.get("state", "")) == "1":
                 return True
-            # Luôn giữ True cho IR child để điều khiển không bị unavailable
+            # Luôn giữ True cho thiết bị con để điều khiển không bị unavailable
             return True
 
         state = str(raw.get("state", ""))
