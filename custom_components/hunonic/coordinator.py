@@ -649,37 +649,65 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._device_index.get(str(device_id), {})
 
     def find_parent_irwifi(self, device: dict[str, Any]) -> dict[str, Any] | None:
-        """Tìm bộ phát hồng ngoại irwifiv2 quản lý thiết bị con irchildv2."""
-        root_id = str(device.get("root_id", ""))
-        home_id = str(device.get("home_id", ""))
+        """Tìm bộ phát hồng ngoại irwifiv2 quản lý thiết bị con irchildv2 chuẩn xác."""
         devices = (self.data or {}).get("devices", [])
+        if not devices:
+            return None
 
-        # 0. Kiểm tra parent_id, hub_id, gateway_id nếu có
+        # 1. Kiểm tra trường liên kết trực tiếp irchild_root_id (chuẩn từ app Hunonic)
+        ir_root_val = ""
+        raw_irchild_root = device.get("irchild_root_id")
+        if isinstance(raw_irchild_root, dict):
+            ir_root_val = str(raw_irchild_root.get("value") or "").strip()
+        elif raw_irchild_root:
+            ir_root_val = str(raw_irchild_root).strip()
+
+        if not ir_root_val:
+            # Tìm trong mảng meta nếu có meta_key == 'irchild_root_id'
+            for m in device.get("meta", []):
+                if isinstance(m, dict) and m.get("meta_key") == "irchild_root_id":
+                    ir_root_val = str(m.get("value") or "").strip()
+                    break
+
+        if ir_root_val:
+            for d in devices:
+                if str(d.get("root_id", "")).strip() == ir_root_val or str(d.get("id", "")).strip() == ir_root_val:
+                    return d
+
+        # 2. Kiểm tra topic root của chính device (topicsub của irchildv2 thường trỏ thẳng tới irwifiv2)
+        dev_topicsub = str(device.get("topicsub") or device.get("topicpub") or "").strip()
+        if dev_topicsub:
+            sub_root = self._topic_root(dev_topicsub)
+            if sub_root:
+                for d in devices:
+                    if str(d.get("root_id", "")).strip() == sub_root:
+                        return d
+
+        # 3. Khớp theo tầng / phòng trong tên thiết bị (ví dụ: 'T4' -> 'IR T4', 'T2' -> 'IR T2')
+        dev_name = str(device.get("name") or "").upper()
+        for d in devices:
+            rt = str(d.get("root_type", "")).lower()
+            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
+                hub_name = str(d.get("name") or "").upper()
+                for floor in ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8"]:
+                    if floor in dev_name and floor in hub_name:
+                        return d
+
+        # 4. Kiểm tra parent_id, hub_id, gateway_id nếu có
         parent_id = str(device.get("parent_id") or device.get("hub_id") or device.get("gateway_id") or "")
         if parent_id:
             for d in devices:
                 if str(d.get("id", "")) == parent_id or str(d.get("root_id", "")) == parent_id:
                     return d
 
-        # 1. Tìm irwifiv2 có ID hoặc root_id trùng với root_id của irchildv2
-        for d in devices:
-            rt = str(d.get("root_type", "")).lower()
-            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
-                if root_id and (str(d.get("id", "")) == root_id or str(d.get("root_id", "")) == root_id):
-                    return d
-
-        # 2. Tìm irwifiv2 trong cùng nhà (home_id)
-        for d in devices:
-            rt = str(d.get("root_type", "")).lower()
-            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
-                if home_id and str(d.get("home_id", "")) == home_id:
-                    return d
-
-        # 3. Fallback: bất kỳ irwifiv2 nào có trong tài khoản
-        for d in devices:
-            rt = str(d.get("root_type", "")).lower()
-            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
-                return d
+        # 5. Fallback cùng nhà CHỈ KHI chỉ có đúng 1 irwifiv2 trong nhà đó
+        home_id = str(device.get("home_id", ""))
+        ir_in_home = [
+            d for d in devices
+            if ("irwifi" in str(d.get("root_type", "")).lower()) and (not home_id or str(d.get("home_id", "")) == home_id)
+        ]
+        if len(ir_in_home) == 1:
+            return ir_in_home[0]
 
         return None
 
