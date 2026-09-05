@@ -496,12 +496,26 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         root_id: str = str(device.get("root_id", ""))
         key_b64 = str(device.get("key", ""))
         iv_b64 = str(device.get("iv", ""))
+        root_type = str(device.get("root_type", ""))
 
         # Lệnh điều khiển PUBLISH tới topicsub (state sẽ báo về topicpub = .../ok).
         if use_gateway:
             topic: str = str(device.get("topicPubGateway", device.get("topic_pub_gateway", "")))
         else:
             topic = str(device.get("topicsub", device.get("topic_sub", "")))
+
+        # Thiết bị con IR (irchildv2): phát tín hiệu qua bộ phát irwifiv2
+        if root_type in ("irchildv2", "irremote"):
+            hub = self.find_parent_irwifi(device)
+            if hub:
+                if not topic:
+                    topic = str(hub.get("topicsub", hub.get("topic_sub", "")))
+                if not key_b64:
+                    key_b64 = str(hub.get("key", ""))
+                if not iv_b64:
+                    iv_b64 = str(hub.get("iv", ""))
+                if not root_id:
+                    root_id = str(hub.get("root_id", ""))
 
         # Publish lên TẤT CẢ broker của thiết bị (primary + backup) — thiết bị nối
         # broker nào trong cặp cũng nhận được; không bị hụt nếu nó ở broker backup.
@@ -568,14 +582,54 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Trả về dữ liệu raw từ REST API theo device_id."""
         return self._device_index.get(str(device_id), {})
 
+    def find_parent_irwifi(self, device: dict[str, Any]) -> dict[str, Any] | None:
+        """Tìm bộ phát hồng ngoại irwifiv2 quản lý thiết bị con irchildv2."""
+        root_id = str(device.get("root_id", ""))
+        home_id = str(device.get("home_id", ""))
+        devices = (self.data or {}).get("devices", [])
+
+        # 1. Tìm irwifiv2 có ID hoặc root_id trùng với root_id của irchildv2
+        for d in devices:
+            if d.get("root_type") in ("irwifiv2", "irwifi"):
+                if root_id and (str(d.get("id", "")) == root_id or str(d.get("root_id", "")) == root_id):
+                    return d
+
+        # 2. Tìm irwifiv2 trong cùng nhà (home_id)
+        for d in devices:
+            if d.get("root_type") in ("irwifiv2", "irwifi"):
+                if home_id and str(d.get("home_id", "")) == home_id:
+                    return d
+
+        # 3. Fallback: bất kỳ irwifiv2 nào có trong tài khoản
+        for d in devices:
+            if d.get("root_type") in ("irwifiv2", "irwifi"):
+                return d
+
+        return None
+
     def is_device_online(self, device_id: str) -> bool:
         """Thiết bị có online không — dựa trên field `state` (1/2) ĐÁNG TIN.
 
-        Đã kiểm chứng: state=1 phản hồi MQTT (online), state=2 KHÔNG phản hồi
-        (offline thật). Dùng cho `available` để không hiện 'bật tắt được' giả
-        (optimistic) trên thiết bị offline. Không có `state` → coi như online.
+        Với thiết bị con IR (irchildv2): đồng bộ online theo bộ phát irwifiv2.
         """
         raw = self._device_index.get(str(device_id), {})
+        root_type = str(raw.get("root_type", ""))
+
+        # irchildv2 đồng bộ online theo cục phát irwifiv2
+        if root_type in ("irchildv2", "irremote"):
+            hub = self.find_parent_irwifi(raw)
+            if hub:
+                hub_state = str(hub.get("state", ""))
+                if hub_state == "1":
+                    return True
+                if hub_state == "2":
+                    return False
+            # Nếu bản thân có state 1 -> online
+            if str(raw.get("state", "")) == "1":
+                return True
+            # Luôn giữ True cho IR child để điều khiển không bị unavailable
+            return True
+
         state = str(raw.get("state", ""))
         if state == "1":
             return True
