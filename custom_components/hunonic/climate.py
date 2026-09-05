@@ -175,11 +175,12 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         dev_name = str(self._device.get("name", "")).upper()
         dev_id = str(self._device.get("id", ""))
 
-        # 1. Trích xuất brand_id từ meta hoặc value
+        # 1. Trích xuất brand_id từ meta, value, hoặc device['brand']
         for m in self._device.get("meta") or []:
             if isinstance(m, dict) and m.get("meta_key") == "irchild_brand_id" and m.get("value"):
                 try:
                     self._brand_id = int(m["value"])
+                    break
                 except Exception:
                     pass
 
@@ -188,31 +189,62 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         if isinstance(val_str, str):
             try:
                 val_obj = json.loads(val_str)
-                if isinstance(val_obj, dict) and val_obj.get("brand"):
+                if isinstance(val_obj, dict) and val_obj.get("brand") and not self._brand_id:
                     self._brand_id = int(val_obj["brand"])
             except Exception:
                 pass
 
-        # 2. Nhận diện Daikin (Điều hòa T4) hoặc Midea (Điều hòa T2)
-        if self._brand_id == 14 or "T4" in dev_name or "DAIKIN" in dev_name or dev_id == "3488246":
-            self._brand_id = 14
+        if not self._brand_id and isinstance(self._device.get("brand"), dict):
+            try:
+                self._brand_id = int(self._device["brand"].get("id"))
+            except Exception:
+                pass
+
+        if not self._brand_id:
+            if "T4" in dev_name or "DAIKIN" in dev_name or dev_id == "3488246":
+                self._brand_id = 14
+            elif "T2" in dev_name or dev_id == "2941402":
+                self._brand_id = 104
+            elif "MIDEA" in dev_name:
+                self._brand_id = 1934
+            else:
+                self._brand_id = 14
+
+        # 2. Đặt cấu hình cơ sở theo brand_id
+        if self._brand_id == 14:
             self._hvac_to_code = dict(DAIKIN_HVAC_TO_CODE)
             self._fan_to_code = dict(DAIKIN_FAN_TO_CODE)
             self._attr_min_temp = 16.0
             self._attr_max_temp = 30.0
             self._has_swing_v = True
             self._has_swing_h = True
-            return
-
-        if self._brand_id == 1934 or "T2" in dev_name or "MIDEA" in dev_name or dev_id in ("3525534", "2941402"):
-            self._brand_id = 1934
+        elif self._brand_id == 104:
+            # Funiki (Điều hòa T2): cool=1, heat=2, dry=3, fan=4, auto=0
+            self._hvac_to_code = {
+                HVACMode.COOL: 1,
+                HVACMode.HEAT: 2,
+                HVACMode.DRY: 3,
+                HVACMode.FAN_ONLY: 4,
+                HVACMode.AUTO: 0,
+            }
+            # fan: min=1, med=3, max=5, auto=0
+            self._fan_to_code = {
+                FAN_LOW: 1,
+                FAN_MEDIUM: 3,
+                FAN_HIGH: 5,
+                FAN_AUTO: 0,
+            }
+            self._attr_min_temp = 17.0
+            self._attr_max_temp = 30.0
+            self._has_swing_v = False
+            self._has_swing_h = False
+        elif self._brand_id == 1934:
             self._hvac_to_code = dict(MIDEA_HVAC_TO_CODE)
             self._fan_to_code = dict(MIDEA_FAN_TO_CODE)
             self._attr_min_temp = 16.0
             self._attr_max_temp = 30.0
             self._has_swing_v = False
             self._has_swing_h = False
-            return
 
         if isinstance(val_obj, dict):
             if int(val_obj.get("swingv", -1)) >= 0:
@@ -220,6 +252,7 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             if int(val_obj.get("swingh", -1)) >= 0:
                 self._has_swing_h = True
 
+        # 3. Nạp và ghi đè chi tiết trực tiếp từ remote array của thiết bị
         rem = self._device.get("remote")
         if isinstance(rem, list):
             for item in rem:
@@ -267,7 +300,7 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
                                     self._fan_to_code[FAN_MEDIUM] = fc
                                 elif fn in ("max", "high", "3"):
                                     self._fan_to_code[FAN_HIGH] = fc
-                                elif fn in ("auto", "0"):
+                                elif fn in ("auto", "0", "10"):
                                     self._fan_to_code[FAN_AUTO] = fc
                     except Exception:
                         pass
@@ -563,7 +596,7 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         t_int = int(round(temp))
         mode_code = self._hvac_to_code.get(hvac_mode, 0)
         fan_code = self._fan_to_code.get(fan_mode, 0)
-        brand_id = self._brand_id or (1934 if "MIDEA" in self.name.upper() else 14)
+        brand_id = self._brand_id or (104 if "T2" in self.name.upper() else (1934 if "MIDEA" in self.name.upper() else 14))
 
         payload: dict[str, Any] = {
             "irwifiv2": 1,
@@ -611,7 +644,7 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
 
     async def _send_off(self) -> None:
         """Gửi lệnh tắt điều hòa chuẩn giao thức Hunonic."""
-        brand_id = self._brand_id or (1934 if "MIDEA" in self.name.upper() else 14)
+        brand_id = self._brand_id or (104 if "T2" in self.name.upper() else (1934 if "MIDEA" in self.name.upper() else 14))
         t_int = int(round(self._target_temp))
         mode_code = self._hvac_to_code.get(self._last_hvac_mode, 0)
         fan_code = self._fan_to_code.get(self._fan_mode, 0)
