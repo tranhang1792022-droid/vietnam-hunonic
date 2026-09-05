@@ -1,7 +1,7 @@
 {
   "domain": "hunonic",
   "name": "Hunonic Smart Home",
-  "version": "1.16.3",
+  "version": "1.16.4",
   "documentation": "https://github.com/tranhang1792022-droid/vietnam-hunonic",
   "issue_tracker": "https://github.com/home-assistant-tools/vietnam-hunonic/issues",
   "requirements": [
@@ -10,7 +10,9 @@
     "cryptography>=3.4.0"
   ],
   "dependencies": [],
-  "codeowners": ["@home-assistant-tools"],
+  "codeowners": [
+    "@home-assistant-tools"
+  ],
   "iot_class": "cloud_push",
   "integration_type": "hub",
   "config_flow": true
