@@ -212,7 +212,16 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
 
     def _mqtt_state(self) -> dict[str, Any]:
         """MQTT realtime state (coordinator dict) của thiết bị này."""
-        return self.coordinator.get_device_state(self._root_id)
+        for rid in filter(None, [self._device_id, self._root_id]):
+            st = self.coordinator.get_device_state(rid)
+            if st:
+                return st
+        hub = self.coordinator.find_parent_irwifi(self._device)
+        if hub:
+            hub_rid = str(hub.get("root_id", ""))
+            if hub_rid:
+                return self.coordinator.get_device_state(hub_rid)
+        return {}
 
     def _raw_value(self) -> dict[str, Any]:
         """Trả về REST `value` đã parse JSON (fallback khi chưa có MQTT state)."""
@@ -418,24 +427,53 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
 
     async def _send_on(self, mode: int, temp: float, fan: int) -> None:
         """Gửi lệnh BẬT với chế độ, nhiệt độ, tốc độ quạt."""
+        t_int = int(round(temp))
+        self._target_temp = float(t_int)
+        self._fan_mode = _FAN_CODE_TO_LABEL.get(fan, self._fan_mode)
+        self._hvac_mode = _MODE_TO_HVAC.get(mode, HVACMode.COOL)
+        self._last_hvac_mode = self._hvac_mode
+
+        # Cập nhật optimistic vào coordinator ngay lập tức
+        st = {
+            "action": 1,
+            "mode": mode,
+            "temp": t_int,
+            "fan": fan,
+        }
+        self.coordinator.update_device_state(self._device_id, st)
+        self.coordinator.update_device_state(self._root_id, st)
+
         payload: dict[str, Any] = {
             "u": self._uid,
             self._root_type: 0,
             "act_id": 0,
             "action": 1,
             "mode": mode,
-            "temp": int(temp),
+            "temp": t_int,
             "fan": fan,
             "src": 1,
         }
+        dev_id = self._device.get("id")
+        if dev_id:
+            try:
+                payload["child_id"] = int(dev_id)
+            except (ValueError, TypeError):
+                payload["child_id"] = dev_id
+
         await self.coordinator.async_control_device(self._device, payload)
+        self.async_write_ha_state()
         _LOGGER.debug(
             "IR AC %s → ON mode=%s temp=%s fan=%s",
-            self._device.get("name"), mode, int(temp), fan,
+            self._device.get("name"), mode, t_int, fan,
         )
 
     async def _send_off(self) -> None:
         """Gửi lệnh TẮT."""
+        self._hvac_mode = HVACMode.OFF
+        st = {"action": 2}
+        self.coordinator.update_device_state(self._device_id, st)
+        self.coordinator.update_device_state(self._root_id, st)
+
         payload: dict[str, Any] = {
             "u": self._uid,
             self._root_type: 0,
@@ -443,7 +481,15 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             "action": 2,
             "src": 1,
         }
+        dev_id = self._device.get("id")
+        if dev_id:
+            try:
+                payload["child_id"] = int(dev_id)
+            except (ValueError, TypeError):
+                payload["child_id"] = dev_id
+
         await self.coordinator.async_control_device(self._device, payload)
+        self.async_write_ha_state()
         _LOGGER.debug("IR AC %s → OFF", self._device.get("name"))
 
     @property

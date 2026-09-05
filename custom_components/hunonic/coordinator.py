@@ -561,9 +561,12 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "MQTT publish '%s' lên %d broker: %s", device.get("name"),
                     len(clients), raw_json,
                 )
-                # Cập nhật state tức thì (optimistic) — cả state chung + per-channel.
-                self._device_state.setdefault(root_id, {}).update(payload)
-                self._record_channel_state(root_id, payload)
+                # Cập nhật state tức thì (optimistic) — cả hub root_id, device root_id và device id.
+                orig_rid = str(device.get("root_id", ""))
+                orig_did = str(device.get("id", ""))
+                for rid_target in filter(None, [root_id, orig_rid, orig_did]):
+                    self._device_state.setdefault(rid_target, {}).update(payload)
+                    self._record_channel_state(rid_target, payload)
                 self.async_set_updated_data(self.data)
                 # Lên lịch refresh sau 2s để đồng bộ trạng thái thật
                 self.hass.loop.call_later(
@@ -588,8 +591,17 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ── State helpers ─────────────────────────────────────────────────────────
 
     def get_device_state(self, root_id: str) -> dict[str, Any]:
-        """Trả về trạng thái MQTT cuối cùng của thiết bị theo root_id."""
-        return self._device_state.get(root_id, {})
+        """Trả về trạng thái MQTT cuối cùng của thiết bị theo root_id hoặc device_id."""
+        return self._device_state.get(str(root_id), {})
+
+    def update_device_state(self, dev_or_root_id: str, new_state: dict[str, Any]) -> None:
+        """Cập nhật optimistic trạng thái thiết bị."""
+        if not dev_or_root_id:
+            return
+        key = str(dev_or_root_id)
+        if key not in self._device_state:
+            self._device_state[key] = {}
+        self._device_state[key].update(new_state)
 
     def get_device_raw(self, device_id: str) -> dict[str, Any]:
         """Trả về dữ liệu raw từ REST API theo device_id."""
@@ -601,21 +613,31 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         home_id = str(device.get("home_id", ""))
         devices = (self.data or {}).get("devices", [])
 
+        # 0. Kiểm tra parent_id, hub_id, gateway_id nếu có
+        parent_id = str(device.get("parent_id") or device.get("hub_id") or device.get("gateway_id") or "")
+        if parent_id:
+            for d in devices:
+                if str(d.get("id", "")) == parent_id or str(d.get("root_id", "")) == parent_id:
+                    return d
+
         # 1. Tìm irwifiv2 có ID hoặc root_id trùng với root_id của irchildv2
         for d in devices:
-            if d.get("root_type") in ("irwifiv2", "irwifi"):
+            rt = str(d.get("root_type", "")).lower()
+            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
                 if root_id and (str(d.get("id", "")) == root_id or str(d.get("root_id", "")) == root_id):
                     return d
 
         # 2. Tìm irwifiv2 trong cùng nhà (home_id)
         for d in devices:
-            if d.get("root_type") in ("irwifiv2", "irwifi"):
+            rt = str(d.get("root_type", "")).lower()
+            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
                 if home_id and str(d.get("home_id", "")) == home_id:
                     return d
 
         # 3. Fallback: bất kỳ irwifiv2 nào có trong tài khoản
         for d in devices:
-            if d.get("root_type") in ("irwifiv2", "irwifi"):
+            rt = str(d.get("root_type", "")).lower()
+            if "irwifi" in rt or rt in ("irwifiv2", "irwifi", "irhub"):
                 return d
 
         return None
