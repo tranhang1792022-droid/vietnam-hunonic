@@ -24,7 +24,7 @@ from homeassistant.components.climate import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -121,6 +121,8 @@ async def async_setup_entry(
 class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, RestoreEntity):
     """Điều hòa IR Hunonic cho Home Assistant."""
 
+    _enable_turn_on_off_backwards_compatibility: bool = False
+
     _attr_hvac_modes = _ALL_HVAC_MODES
     _attr_fan_modes = _ALL_FAN_MODES
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
@@ -138,6 +140,7 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         self._attr_max_temp = float(IR_TEMP_MAX)
 
         # Profile cấu hình lệnh
+        self._brand_id: int | None = None
         self._hvac_to_code: dict[HVACMode, int] = dict(MIDEA_HVAC_TO_CODE)
         self._fan_to_code: dict[str, int] = dict(MIDEA_FAN_TO_CODE)
         self._has_swing_v: bool = False
@@ -172,7 +175,37 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         dev_name = str(self._device.get("name", "")).upper()
         dev_id = str(self._device.get("id", ""))
 
-        if "T2" in dev_name or "MIDEA" in dev_name or dev_id in ("3525534", "2941402"):
+        # 1. Trích xuất brand_id từ meta hoặc value
+        for m in self._device.get("meta") or []:
+            if isinstance(m, dict) and m.get("meta_key") == "irchild_brand_id" and m.get("value"):
+                try:
+                    self._brand_id = int(m["value"])
+                except Exception:
+                    pass
+
+        val_obj: dict[str, Any] = {}
+        val_str = self._device.get("value")
+        if isinstance(val_str, str):
+            try:
+                val_obj = json.loads(val_str)
+                if isinstance(val_obj, dict) and val_obj.get("brand"):
+                    self._brand_id = int(val_obj["brand"])
+            except Exception:
+                pass
+
+        # 2. Nhận diện Daikin (Điều hòa T4) hoặc Midea (Điều hòa T2)
+        if self._brand_id == 14 or "T4" in dev_name or "DAIKIN" in dev_name or dev_id == "3488246":
+            self._brand_id = 14
+            self._hvac_to_code = dict(DAIKIN_HVAC_TO_CODE)
+            self._fan_to_code = dict(DAIKIN_FAN_TO_CODE)
+            self._attr_min_temp = 16.0
+            self._attr_max_temp = 30.0
+            self._has_swing_v = True
+            self._has_swing_h = True
+            return
+
+        if self._brand_id == 1934 or "T2" in dev_name or "MIDEA" in dev_name or dev_id in ("3525534", "2941402"):
+            self._brand_id = 1934
             self._hvac_to_code = dict(MIDEA_HVAC_TO_CODE)
             self._fan_to_code = dict(MIDEA_FAN_TO_CODE)
             self._attr_min_temp = 16.0
@@ -181,14 +214,11 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             self._has_swing_h = False
             return
 
-        if "T4" in dev_name or "DAIKIN" in dev_name or dev_id == "3488246":
-            self._hvac_to_code = dict(DAIKIN_HVAC_TO_CODE)
-            self._fan_to_code = dict(DAIKIN_FAN_TO_CODE)
-            self._attr_min_temp = 16.0
-            self._attr_max_temp = 30.0
-            self._has_swing_v = True
-            self._has_swing_h = True
-            return
+        if isinstance(val_obj, dict):
+            if int(val_obj.get("swingv", -1)) >= 0:
+                self._has_swing_v = True
+            if int(val_obj.get("swingh", -1)) >= 0:
+                self._has_swing_h = True
 
         rem = self._device.get("remote")
         if isinstance(rem, list):
@@ -246,29 +276,129 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
                 elif kname == "swingh" and kval:
                     self._has_swing_h = True
 
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Đồng bộ trạng thái tức thì khi có cập nhật từ Coordinator hoặc Nút bấm."""
+        if self._sync_from_coordinator_state():
+            self.async_write_ha_state()
+
+    def _sync_from_coordinator_state(self) -> bool:
+        """Cập nhật các thuộc tính hvac_mode, target_temp, fan_mode, swing_mode từ coordinator."""
+        st = dict(
+            self.coordinator.get_device_state(self._device_id)
+            or self.coordinator.get_device_state(self._root_id)
+            or {}
+        )
+        val_str = self._device.get("value")
+        if isinstance(val_str, str):
+            try:
+                val_obj = json.loads(val_str)
+                if isinstance(val_obj, dict):
+                    for k, v in val_obj.items():
+                        st.setdefault(k, v)
+            except Exception:
+                pass
+
+        if not st:
+            return False
+
+        changed = False
+
+        # 1. Bật / Tắt & Chế độ
+        if "power" in st:
+            p = int(st["power"])
+            if p == 0:
+                if self._hvac_mode != HVACMode.OFF:
+                    self._hvac_mode = HVACMode.OFF
+                    changed = True
+            else:
+                m_code = st.get("mode")
+                if m_code is not None:
+                    try:
+                        m_int = int(m_code)
+                        for hm, code in self._hvac_to_code.items():
+                            if code == m_int and hm != HVACMode.OFF:
+                                if self._hvac_mode != hm:
+                                    self._hvac_mode = hm
+                                    self._last_hvac_mode = hm
+                                    changed = True
+                                break
+                    except (ValueError, TypeError):
+                        pass
+                elif self._hvac_mode == HVACMode.OFF:
+                    self._hvac_mode = self._last_hvac_mode
+                    changed = True
+
+        # 2. Nhiệt độ
+        if "temp" in st:
+            try:
+                t = float(st["temp"])
+                if t > 45:
+                    t = (t - 32) * 5 / 9
+                t = max(self._attr_min_temp, min(self._attr_max_temp, float(round(t))))
+                if self._target_temp != t:
+                    self._target_temp = t
+                    changed = True
+            except (ValueError, TypeError):
+                pass
+
+        # 3. Quạt
+        if "fan" in st:
+            try:
+                f_int = int(st["fan"])
+                for fn, code in self._fan_to_code.items():
+                    if code == f_int:
+                        if self._fan_mode != fn:
+                            self._fan_mode = fn
+                            changed = True
+                        break
+            except (ValueError, TypeError):
+                pass
+
+        # 4. Cánh vẫy
+        sv = int(st.get("swingv", -1))
+        sh = int(st.get("swingh", -1))
+        target_swing = None
+        if sv == 15 and sh == 15:
+            target_swing = SWING_BOTH
+        elif sv == 15:
+            target_swing = SWING_VERTICAL
+        elif sh == 15:
+            target_swing = SWING_HORIZONTAL
+        elif sv == 0 or sh == 0:
+            target_swing = SWING_OFF
+
+        if target_swing and self._swing_mode != target_swing:
+            self._swing_mode = target_swing
+            changed = True
+
+        return changed
+
     async def async_added_to_hass(self) -> None:
-        """Khôi phục trạng thái lần trước."""
+        """Khôi phục trạng thái lần trước hoặc đồng bộ từ coordinator."""
         await super().async_added_to_hass()
         last = await self.async_get_last_state()
-        if last is None:
-            return
-        if last.state in {m.value for m in _ALL_HVAC_MODES}:
-            self._hvac_mode = HVACMode(last.state)
-        attrs = last.attributes
-        t = attrs.get("temperature")
-        if t is not None:
-            try:
-                self._target_temp = max(self._attr_min_temp, min(self._attr_max_temp, float(t)))
-            except (TypeError, ValueError):
-                pass
-        fm = attrs.get("fan_mode")
-        if fm in _ALL_FAN_MODES:
-            self._fan_mode = fm
-        sm = attrs.get("swing_mode")
-        if sm in _ALL_SWING_MODES:
-            self._swing_mode = sm
-        if self._hvac_mode != HVACMode.OFF:
-            self._last_hvac_mode = self._hvac_mode
+        if last is not None:
+            if last.state in {m.value for m in _ALL_HVAC_MODES}:
+                self._hvac_mode = HVACMode(last.state)
+            attrs = last.attributes
+            t = attrs.get("temperature")
+            if t is not None:
+                try:
+                    self._target_temp = max(self._attr_min_temp, min(self._attr_max_temp, float(t)))
+                except (TypeError, ValueError):
+                    pass
+            fm = attrs.get("fan_mode")
+            if fm in _ALL_FAN_MODES:
+                self._fan_mode = fm
+            sm = attrs.get("swing_mode")
+            if sm in _ALL_SWING_MODES:
+                self._swing_mode = sm
+            if self._hvac_mode != HVACMode.OFF:
+                self._last_hvac_mode = self._hvac_mode
+
+        # Ưu tiên đồng bộ trạng thái từ coordinator / device value nếu có
+        self._sync_from_coordinator_state()
 
     @property
     def unique_id(self) -> str:
@@ -300,6 +430,11 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         return self._hvac_mode
 
     @property
+    def current_temperature(self) -> float | None:
+        """Nhiệt độ hiện tại (đồng bộ với nhiệt độ đặt do điều hòa IR không có cảm biến phản hồi)."""
+        return self._target_temp
+
+    @property
     def target_temperature(self) -> float:
         return self._target_temp
 
@@ -317,16 +452,18 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         """Đặt chế độ HVAC."""
         if hvac_mode == HVACMode.OFF:
             await self._send_off()
+            self._hvac_mode = HVACMode.OFF
         else:
+            self._hvac_mode = hvac_mode
+            self._last_hvac_mode = hvac_mode
             await self._send_on(
                 hvac_mode=hvac_mode,
                 temp=self._target_temp,
                 fan_mode=self._fan_mode,
                 swing_mode=self._swing_mode,
             )
-            self._last_hvac_mode = hvac_mode
-        self._hvac_mode = hvac_mode
         self.async_write_ha_state()
+        self.coordinator.async_set_updated_data(self.coordinator.data)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Đặt nhiệt độ mục tiêu."""
@@ -338,6 +475,16 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             temp_val = (temp_val - 32) * 5 / 9
         temp_val = max(self._attr_min_temp, min(self._attr_max_temp, float(round(temp_val))))
         self._target_temp = temp_val
+
+        # Cập nhật hvac_mode nếu được truyền kèm khi xoay vòng tròn nhiệt độ
+        hvac_mode = kwargs.get("hvac_mode")
+        if hvac_mode:
+            try:
+                self._hvac_mode = HVACMode(hvac_mode)
+                if self._hvac_mode != HVACMode.OFF:
+                    self._last_hvac_mode = self._hvac_mode
+            except Exception:
+                pass
 
         hvac = self._hvac_mode if self._hvac_mode != HVACMode.OFF else self._last_hvac_mode
         if hvac == HVACMode.OFF:
@@ -351,6 +498,7 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             swing_mode=self._swing_mode,
         )
         self.async_write_ha_state()
+        self.coordinator.async_set_updated_data(self.coordinator.data)
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Đặt tốc độ quạt."""
@@ -364,6 +512,7 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
                     swing_mode=self._swing_mode,
                 )
             self.async_write_ha_state()
+            self.coordinator.async_set_updated_data(self.coordinator.data)
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         """Đặt cánh vẫy gió."""
@@ -377,6 +526,7 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
                     swing_mode=swing_mode,
                 )
             self.async_write_ha_state()
+            self.coordinator.async_set_updated_data(self.coordinator.data)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Bật điều hòa."""
@@ -389,19 +539,18 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             swing_mode=self._swing_mode,
         )
         self.async_write_ha_state()
+        self.coordinator.async_set_updated_data(self.coordinator.data)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Tắt điều hòa."""
         await self._send_off()
         self._hvac_mode = HVACMode.OFF
         self.async_write_ha_state()
+        self.coordinator.async_set_updated_data(self.coordinator.data)
 
     @property
     def _uid(self) -> int:
-        try:
-            return int(self.coordinator._user_id or 0)
-        except (TypeError, ValueError):
-            return 0
+        return self.coordinator.get_device_uid(self._device)
 
     async def _send_on(
         self,
@@ -410,20 +559,22 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         fan_mode: str,
         swing_mode: str,
     ) -> None:
-        """Gửi lệnh bật điều hòa kèm chế độ, nhiệt độ, quạt, cánh vẫy."""
+        """Gửi lệnh bật điều hòa kèm chế độ, nhiệt độ, quạt, cánh vẫy chuẩn giao thức Hunonic."""
         t_int = int(round(temp))
         mode_code = self._hvac_to_code.get(hvac_mode, 0)
         fan_code = self._fan_to_code.get(fan_mode, 0)
+        brand_id = self._brand_id or (1934 if "MIDEA" in self.name.upper() else 14)
 
         payload: dict[str, Any] = {
-            "u": self._uid,
-            self._root_type: 0,
-            "act_id": 0,
-            "action": 1,
-            "mode": mode_code,
+            "irwifiv2": 1,
+            "type": 1,
+            "brand": int(brand_id),
+            "power": 1,
             "temp": t_int,
+            "mode": mode_code,
             "fan": fan_code,
-            "src": 1,
+            "act": 0,
+            "u": self._uid,
         }
 
         if self._has_swing_v:
@@ -438,18 +589,49 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             except (ValueError, TypeError):
                 payload["child_id"] = dev_id
 
+        # Cập nhật state nội bộ và coordinator để các Button đồng bộ ngay lập tức
+        val_obj = {
+            "power": 1,
+            "temp": t_int,
+            "mode": mode_code,
+            "fan": fan_code,
+            "brand": int(brand_id),
+        }
+        if self._has_swing_v:
+            val_obj["swingv"] = payload.get("swingv", 0)
+        if self._has_swing_h:
+            val_obj["swingh"] = payload.get("swingh", 0)
+        self._device["value"] = json.dumps(val_obj)
+        self.coordinator.update_device_state(self._device_id, val_obj)
+        self.coordinator.update_device_state(self._root_id, val_obj)
+
         await self.coordinator.async_control_device(self._device, payload)
+        self.coordinator.async_set_updated_data(self.coordinator.data)
         _LOGGER.debug("Gửi lệnh điều hòa ON tới %s: %s", self._device.get("name"), payload)
 
     async def _send_off(self) -> None:
-        """Gửi lệnh tắt điều hòa."""
+        """Gửi lệnh tắt điều hòa chuẩn giao thức Hunonic."""
+        brand_id = self._brand_id or (1934 if "MIDEA" in self.name.upper() else 14)
+        t_int = int(round(self._target_temp))
+        mode_code = self._hvac_to_code.get(self._last_hvac_mode, 0)
+        fan_code = self._fan_to_code.get(self._fan_mode, 0)
+
         payload: dict[str, Any] = {
+            "irwifiv2": 1,
+            "type": 1,
+            "brand": int(brand_id),
+            "power": 0,
+            "temp": t_int,
+            "mode": mode_code,
+            "fan": fan_code,
+            "act": 0,
             "u": self._uid,
-            self._root_type: 0,
-            "act_id": 0,
-            "action": 2,
-            "src": 1,
         }
+        if self._has_swing_v:
+            payload["swingv"] = 0
+        if self._has_swing_h:
+            payload["swingh"] = 0
+
         dev_id = self._device.get("id")
         if dev_id:
             try:
@@ -457,5 +639,21 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             except (ValueError, TypeError):
                 payload["child_id"] = dev_id
 
+        val_obj = {
+            "power": 0,
+            "temp": t_int,
+            "mode": mode_code,
+            "fan": fan_code,
+            "brand": int(brand_id),
+        }
+        if self._has_swing_v:
+            val_obj["swingv"] = 0
+        if self._has_swing_h:
+            val_obj["swingh"] = 0
+        self._device["value"] = json.dumps(val_obj)
+        self.coordinator.update_device_state(self._device_id, val_obj)
+        self.coordinator.update_device_state(self._root_id, val_obj)
+
         await self.coordinator.async_control_device(self._device, payload)
+        self.coordinator.async_set_updated_data(self.coordinator.data)
         _LOGGER.debug("Gửi lệnh điều hòa OFF tới %s: %s", self._device.get("name"), payload)
