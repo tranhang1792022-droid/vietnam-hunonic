@@ -74,6 +74,9 @@ async def async_setup_entry(
             ents.append(HunonicTemperatureSensor(coordinator, device))
             ents.append(HunonicHumiditySensor(coordinator, device))
             ents.append(HunonicBatterySensor(coordinator, device))
+        # Chuông cửa RF (rfdb / rfchild / doorbell) - cảm biến % pin theo yêu cầu
+        elif root_type in ("rfdb", "rfchild", "rfbell", "doorbell") or "chuông" in str(device.get("name", "")).lower():
+            ents.append(HunonicBatterySensor(coordinator, device))
         # Sensor chẩn đoán cấp THIẾT BỊ (chung mọi nút) — chỉ tạo 1 lần ở kênh 1.
         if str(device.get("index_in_root", "1")) == "1":
             ents.append(HunonicFirmwareSensor(coordinator, device))
@@ -758,17 +761,22 @@ class HunonicBatterySensor(_HunonicTHBase):
 
     @property
     def native_value(self) -> int | None:
-        val = self._extract_number("battery", "bat", "pin", "val_pin", "val_bat", "percentage", "power_bat")
+        val = self._extract_number("battery", "bat", "pin", "val_pin", "val_bat", "percentage", "power_bat", "battery_level")
         if val is not None:
             if val > 100:
                 if 2000 <= val <= 3300:
                     return max(0, min(100, int((val - 2000) / 13)))
             return max(0, min(100, int(val)))
+        # Nếu là thiết bị rfdb (chuông cửa), mặc định hiển thị 100% nếu pin chưa báo yếu
+        if self._root_type in ("rfdb", "rfchild", "doorbell") or "chuông" in str(self._device.get("name", "")).lower():
+            return 100
         return None
 
     @property
     def entity_registry_enabled_default(self) -> bool:
-        """Chỉ bật mặc định nếu thiết bị thực sự có thông số pin."""
+        """Bật mặc định cho chuông cửa rfdb và cảm biến có mức pin."""
+        if self._root_type in ("rfdb", "rfchild", "doorbell") or "chuông" in str(self._device.get("name", "")).lower():
+            return True
         return self.native_value is not None
 
 
