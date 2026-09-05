@@ -496,55 +496,96 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             True nếu publish thành công.
         """
         root_id: str = str(device.get("root_id", ""))
-        key_b64 = str(device.get("key", ""))
-        iv_b64 = str(device.get("iv", ""))
         root_type = str(device.get("root_type", ""))
+
+        raw_key = device.get("key")
+        raw_iv = device.get("iv")
+        key_b64 = str(raw_key).strip() if raw_key and str(raw_key).strip().lower() != "none" else ""
+        iv_b64 = str(raw_iv).strip() if raw_iv and str(raw_iv).strip().lower() != "none" else ""
 
         # Lệnh điều khiển PUBLISH tới topicsub (state sẽ báo về topicpub = .../ok).
         if use_gateway:
-            topic: str = str(device.get("topicPubGateway", device.get("topic_pub_gateway", "")))
+            topic: str = str(device.get("topicPubGateway") or device.get("topic_pub_gateway") or "").strip()
         else:
-            topic = str(device.get("topicsub", device.get("topic_sub", "")))
+            topic = str(device.get("topicsub") or device.get("topic_sub") or "").strip()
+
+        # Fallback 1: Nếu chưa có topic điều khiển, lấy từ topicpub (bỏ '/ok' ở cuối)
+        if not topic or topic.lower() == "none":
+            pub = str(device.get("topicpub") or device.get("topic_pub") or "").strip()
+            if pub and pub.lower() != "none":
+                topic = pub[:-3] if pub.endswith("/ok") else pub
+
+        # Fallback 2: Nếu có topicPubGateway
+        if not topic or topic.lower() == "none":
+            gw = str(device.get("topicPubGateway") or device.get("topic_pub_gateway") or "").strip()
+            if gw and gw.lower() != "none":
+                topic = gw[:-3] if gw.endswith("/ok") else gw
+
+        # Fallback 3: Tự tạo topic nếu có ownerId, root_id, ts
+        if not topic or topic.lower() == "none":
+            uid = device.get("owner_id") or device.get("user_id") or self._user_id
+            rid = device.get("root_id")
+            ts = device.get("ts") or device.get("time_stamp")
+            if uid and rid and ts:
+                topic = f"u/{uid}/{rid}/{ts}"
 
         # Thiết bị con IR (irchildv2): phát tín hiệu qua bộ phát irwifiv2
         if root_type in ("irchildv2", "irremote"):
             hub = self.find_parent_irwifi(device)
             if hub:
                 # Bắt buộc dùng topic và key/iv của irwifiv2 để irwifiv2 nhận và giải mã được
-                hub_topic = str(hub.get("topicsub", hub.get("topic_sub", "")))
+                hub_topic = str(hub.get("topicsub") or hub.get("topic_sub") or "").strip()
+                if not hub_topic or hub_topic.lower() == "none":
+                    hub_pub = str(hub.get("topicpub") or hub.get("topic_pub") or "").strip()
+                    if hub_pub and hub_pub.lower() != "none":
+                        hub_topic = hub_pub[:-3] if hub_pub.endswith("/ok") else hub_pub
                 if hub_topic:
                     topic = hub_topic
-                hub_key = str(hub.get("key", ""))
-                if hub_key:
-                    key_b64 = hub_key
-                hub_iv = str(hub.get("iv", ""))
-                if hub_iv:
-                    iv_b64 = hub_iv
-                hub_rid = str(hub.get("root_id", ""))
-                if hub_rid:
+                hk = str(hub.get("key") or "").strip()
+                if hk and hk.lower() != "none":
+                    key_b64 = hk
+                hi = str(hub.get("iv") or "").strip()
+                if hi and hi.lower() != "none":
+                    iv_b64 = hi
+                hub_rid = str(hub.get("root_id") or "").strip()
+                if hub_rid and hub_rid.lower() != "none":
                     root_id = hub_rid
                 payload["irwifiv2"] = 0
                 payload.setdefault("irchildv2", 0)
                 if device.get("id"):
-                    payload.setdefault("child_id", device.get("id"))
+                    try:
+                        payload.setdefault("child_id", int(device.get("id")))
+                    except (ValueError, TypeError):
+                        payload.setdefault("child_id", device.get("id"))
 
-        # Publish lên TẤT CẢ broker của thiết bị (primary + backup)
+        # Publish lên tất cả broker khả dụng (cả broker thiết bị và toàn bộ client đang nối)
         brokers = self._device_brokers.get(self._topic_root(topic), []) if topic else []
-        clients = [
+        target_clients = [
             self._mqtt_clients[b]
             for b in brokers
             if b in self._mqtt_clients and self._mqtt_clients[b].is_connected()
         ]
-        # Nếu broker mapping chưa có, dùng tất cả client MQTT đang kết nối để gửi ngay lập tức
-        if not clients and self._mqtt_clients:
-            clients = [c for c in self._mqtt_clients.values() if c.is_connected()]
+        all_connected = [c for c in self._mqtt_clients.values() if c.is_connected()]
+        # Gom deduplicate tất cả broker
+        clients = list({id(c): c for c in (target_clients + all_connected)}.values())
 
         if clients and topic:
             raw_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            # Kiểm tra tính hợp lệ của key_b64 và iv_b64
+            valid_key_iv = False
+            if key_b64 and iv_b64:
+                try:
+                    k_bytes = base64.b64decode(key_b64)
+                    i_bytes = base64.b64decode(iv_b64)
+                    if len(k_bytes) in (16, 24, 32) and len(i_bytes) == 16:
+                        valid_key_iv = True
+                except Exception:
+                    valid_key_iv = False
+
             try:
                 # PHẢI publish CIPHERTEXT NHỊ PHÂN THÔ (KHÔNG base64) — thiết bị bỏ qua
                 # lệnh base64. Xác minh qua MITM app (app gửi 64 byte thô lên topicsub).
-                if key_b64 and iv_b64:
+                if valid_key_iv:
                     payload_bytes = encrypt_bytes_with_keyiv(raw_json, key_b64, iv_b64)
                 else:
                     payload_bytes = encrypt_bytes_payload(raw_json, root_id)

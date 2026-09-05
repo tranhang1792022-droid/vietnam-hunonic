@@ -35,6 +35,17 @@ from .entity_setup import setup_entities
 _LOGGER = logging.getLogger(__name__)
 
 
+def _is_doorbell_or_chime(device: dict[str, Any]) -> bool:
+    """Kiểm tra xem thiết bị có phải là chuông cửa (rfdb) hoặc loa chuông (hsrf) không."""
+    rt = str(device.get("root_type") or "").lower().strip()
+    name = str(device.get("name") or "").lower().strip()
+    if any(t in rt for t in ("rfdb", "rfbell", "doorbell", "hsrf", "chime", "bell")):
+        return True
+    if any(n in name for n in ("chuông", "chuong", "hsrf", "chime", "bell")):
+        return True
+    return False
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -45,7 +56,7 @@ async def async_setup_entry(
     def _build(coordinator: HunonicCoordinator, device: dict[str, Any]):
         rt = device.get("root_type")
         ents = []
-        if rt in DOORBELL_TYPES:
+        if _is_doorbell_or_chime(device):
             ents.append(HunonicDoorbellButton(coordinator, device))
         if rt in IR_FAN_REMOTE_TYPES:
             ents.extend([
@@ -66,11 +77,10 @@ async def async_setup_entry(
 
 
 class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity):
-    """Nút bấm 'Reo chuông' cho thiết bị chuông cửa RF Hunonic.
+    """Nút bấm 'Reo chuông' cho thiết bị chuông cửa RF Hunonic (hsrf / rfdb).
 
-    Bấm nút → gửi MQTT action=1 → chuông kêu 1 lần.
-    ButtonEntity phù hợp hơn SwitchEntity vì đây là trigger (xung), không phải
-    trạng thái bật/tắt — HA không lưu state sau khi bấm.
+    Bấm nút → gửi MQTT action=1 tới tất cả thiết bị hsrf / chuông cắm điện trong nhà.
+    Tự động gửi reset sau 2 giây để chuông sẵn sàng cho lần bấm tiếp theo.
     """
 
     _attr_device_class = ButtonDeviceClass.IDENTIFY
@@ -109,37 +119,78 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
         return self.coordinator.is_device_online(self._device_id)
 
     async def async_press(self) -> None:
-        """Bấm nút -> kích hoạt chuông hiện tại và TẤT CẢ thiết bị hsrf cùng kêu lên."""
-        # 1. Gửi lệnh tới thiết bị hiện tại
-        payload: dict[str, Any] = {
-            "u": self._uid,
-            self._root_type: 0,
-            "act_id": 0,
-            "action": 1,
-            "src": 1,
-        }
-        await self.coordinator.async_control_device(self._device, payload)
-        _LOGGER.debug("Đã gửi lệnh reo chuông tới: %s", self._device.get("name"))
-
-        # 2. Tìm tất cả thiết bị hsrf (Hunonic Smart RF / Chuông cắm điện) cùng tài khoản
+        """Bấm nút -> kích hoạt TẤT CẢ các thiết bị chuông hsrf / doorbell cùng reo lên."""
+        import asyncio
         devices = (self.coordinator.data or {}).get("devices", [])
-        hsrf_devices = [
-            d for d in devices
-            if d.get("root_type") in CHIME_TYPES
-            and str(d.get("id")) != self._device_id
-        ]
 
-        for hsrf_dev in hsrf_devices:
-            rt = str(hsrf_dev.get("root_type", "hsrf"))
-            hsrf_payload: dict[str, Any] = {
+        # 1. Tìm tất cả thiết bị chuông / hsrf trong tài khoản
+        chime_targets: list[dict[str, Any]] = []
+        for d in devices:
+            if _is_doorbell_or_chime(d):
+                chime_targets.append(d)
+
+        # Đảm bảo thiết bị hiện tại luôn có trong danh sách
+        target_ids = {str(d.get("id")) for d in chime_targets if d.get("id")}
+        if str(self._device_id) not in target_ids:
+            chime_targets.append(self._device)
+
+        _LOGGER.info(
+            "Hunonic: Kích hoạt reo chuông tới %d thiết bị: %s",
+            len(chime_targets),
+            [d.get("name") for d in chime_targets],
+        )
+
+        # 2. Gửi lệnh BẬT reo chuông tới từng thiết bị
+        for dev in chime_targets:
+            rt = str(dev.get("root_type") or "hsrf").strip()
+            idx = max(1, int(dev.get("index_in_root", 1)))
+            ch = max(0, idx - 1)
+            act_on = 2 * idx - 1  # 1 cho kênh 1, 3 cho kênh 2
+
+            payload: dict[str, Any] = {
                 "u": self._uid,
-                rt: 0,
+                rt: ch,
+                "hsrf": ch,
                 "act_id": 0,
-                "action": 1,
+                "action": act_on,
                 "src": 1,
+                "ring": 1,
+                "bell": 1,
             }
-            await self.coordinator.async_control_device(hsrf_dev, hsrf_payload)
-            _LOGGER.info("Đã gửi lệnh reo chuông tới hsrf: %s (id: %s)", hsrf_dev.get("name"), hsrf_dev.get("id"))
+            if dev.get("id"):
+                try:
+                    payload["child_id"] = int(dev.get("id"))
+                except (ValueError, TypeError):
+                    payload["child_id"] = dev.get("id")
+
+            await self.coordinator.async_control_device(dev, payload)
+            _LOGGER.debug("Đã gửi lệnh reo chuông tới: %s (action=%s)", dev.get("name"), act_on)
+
+        # 3. Tự động gửi lệnh OFF sau 2 giây để reset trạng thái chuông sẵn sàng cho lần bấm tiếp theo
+        async def _reset_chimes():
+            await asyncio.sleep(2.0)
+            for dev in chime_targets:
+                rt = str(dev.get("root_type") or "hsrf").strip()
+                idx = max(1, int(dev.get("index_in_root", 1)))
+                ch = max(0, idx - 1)
+                act_off = 2 * idx  # 2 cho kênh 1, 4 cho kênh 2
+                payload_off: dict[str, Any] = {
+                    "u": self._uid,
+                    rt: ch,
+                    "hsrf": ch,
+                    "act_id": 0,
+                    "action": act_off,
+                    "src": 1,
+                }
+                if dev.get("id"):
+                    try:
+                        payload_off["child_id"] = int(dev.get("id"))
+                    except (ValueError, TypeError):
+                        payload_off["child_id"] = dev.get("id")
+                await self.coordinator.async_control_device(dev, payload_off)
+            _LOGGER.debug("Đã reset trạng thái các thiết bị chuông về OFF")
+
+        self.hass.async_create_task(_reset_chimes())
 
     @property
     def _uid(self) -> int:

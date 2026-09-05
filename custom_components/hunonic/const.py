@@ -102,6 +102,8 @@ SWITCH_TYPES = [
     # Aptomat/công tơ TỔNG wifi — đóng/cắt CẢ NHÀ. Có on/off như công tắc 1 kênh.
     # ⚠️ TẮT là mất điện toàn nhà — không đưa vào automation vô ý.
     "atmwifi", "atmwifiv2",
+    # Chuông điện thông minh Hunonic Smart RF (hsrf)
+    "hsrf", "hsrfv2", "hsrfwifi",
 ]
 # Công tơ điện (aptomat đo điện): ngoài on/off còn có sensor điện năng/tiền điện
 # + công suất tức thời (data_extra.power_current). atmwifi* = công tơ tổng cả nhà.
