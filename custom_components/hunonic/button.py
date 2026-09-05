@@ -119,37 +119,39 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
         return self.coordinator.is_device_online(self._device_id)
 
     async def async_press(self) -> None:
-        """Bấm nút -> kích hoạt TẤT CẢ các thiết bị chuông hsrf / doorbell cùng reo lên."""
+        """Bấm nút -> kích hoạt TẤT CẢ các thiết bị chuông hsrf (RF T1, RF T4...) cùng reo lên."""
         import asyncio
         devices = (self.coordinator.data or {}).get("devices", [])
 
-        # 1. Tìm tất cả thiết bị chuông / hsrf trong tài khoản
-        chime_targets: list[dict[str, Any]] = []
-        for d in devices:
-            if _is_doorbell_or_chime(d):
-                chime_targets.append(d)
+        # 1. Tìm tất cả thiết bị loa chuông hsrf trong tài khoản (RF T1, RF T4...)
+        chime_targets: list[dict[str, Any]] = [
+            d for d in devices
+            if str(d.get("root_type", "")).lower() == "hsrf"
+            or "hsrf" in str(d.get("root_id", "")).lower()
+            or "hsrf" in str(d.get("type", "")).lower()
+        ]
 
-        # Đảm bảo thiết bị hiện tại luôn có trong danh sách
-        target_ids = {str(d.get("id")) for d in chime_targets if d.get("id")}
-        if str(self._device_id) not in target_ids:
-            chime_targets.append(self._device)
+        # Nếu không tìm thấy bằng root_type, tìm theo tên hoặc topicsub
+        if not chime_targets:
+            for d in devices:
+                name_upper = str(d.get("name", "")).upper()
+                if "RF T" in name_upper or "HSRF" in name_upper:
+                    chime_targets.append(d)
 
         _LOGGER.info(
-            "Hunonic: Kích hoạt reo chuông tới %d thiết bị: %s",
+            "Hunonic: Kích hoạt reo chuông đồng thời tới %d thiết bị hsrf: %s",
             len(chime_targets),
             [d.get("name") for d in chime_targets],
         )
 
-        # 2. Gửi lệnh BẬT reo chuông tới từng thiết bị
+        # 2. Gửi lệnh BẬT reo chuông tới từng thiết bị hsrf
         for dev in chime_targets:
-            rt = str(dev.get("root_type") or "hsrf").strip()
             idx = max(1, int(dev.get("index_in_root", 1)))
             ch = max(0, idx - 1)
-            act_on = 2 * idx - 1  # 1 cho kênh 1, 3 cho kênh 2
+            act_on = 2 * idx - 1  # 1 cho kênh 1
 
             payload: dict[str, Any] = {
                 "u": self._uid,
-                rt: ch,
                 "hsrf": ch,
                 "act_id": 0,
                 "action": act_on,
@@ -157,38 +159,27 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
                 "ring": 1,
                 "bell": 1,
             }
-            if dev.get("id"):
-                try:
-                    payload["child_id"] = int(dev.get("id"))
-                except (ValueError, TypeError):
-                    payload["child_id"] = dev.get("id")
-
             await self.coordinator.async_control_device(dev, payload)
-            _LOGGER.debug("Đã gửi lệnh reo chuông tới: %s (action=%s)", dev.get("name"), act_on)
+            _LOGGER.debug("Đã gửi lệnh reo chuông tới hsrf: %s (action=%s)", dev.get("name"), act_on)
 
-        # 3. Tự động gửi lệnh OFF sau 2 giây để reset trạng thái chuông sẵn sàng cho lần bấm tiếp theo
+        # 3. Tự động gửi lệnh OFF sau 2 giây để reset chuông sẵn sàng cho lần bấm tiếp theo
         async def _reset_chimes():
             await asyncio.sleep(2.0)
             for dev in chime_targets:
-                rt = str(dev.get("root_type") or "hsrf").strip()
                 idx = max(1, int(dev.get("index_in_root", 1)))
                 ch = max(0, idx - 1)
-                act_off = 2 * idx  # 2 cho kênh 1, 4 cho kênh 2
+                act_off = 2 * idx  # 2 cho kênh 1
                 payload_off: dict[str, Any] = {
                     "u": self._uid,
-                    rt: ch,
                     "hsrf": ch,
                     "act_id": 0,
                     "action": act_off,
                     "src": 1,
+                    "ring": 0,
+                    "bell": 0,
                 }
-                if dev.get("id"):
-                    try:
-                        payload_off["child_id"] = int(dev.get("id"))
-                    except (ValueError, TypeError):
-                        payload_off["child_id"] = dev.get("id")
                 await self.coordinator.async_control_device(dev, payload_off)
-            _LOGGER.debug("Đã reset trạng thái các thiết bị chuông về OFF")
+            _LOGGER.debug("Đã reset trạng thái các thiết bị hsrf về OFF")
 
         self.hass.async_create_task(_reset_chimes())
 
