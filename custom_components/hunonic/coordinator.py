@@ -446,7 +446,9 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
         if state:
-            self._device_state[root_id] = state
+            if root_id not in self._device_state:
+                self._device_state[root_id] = {}
+            self._device_state[root_id].update(state)
             self._record_channel_state(root_id, state)
             _LOGGER.debug("MQTT update root_id=%s state=%s", root_id, state)
             if self._mqtt_loop and self.data:
@@ -508,16 +510,23 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if root_type in ("irchildv2", "irremote"):
             hub = self.find_parent_irwifi(device)
             if hub:
-                if not topic:
-                    topic = str(hub.get("topicsub", hub.get("topic_sub", "")))
-                if not key_b64:
-                    key_b64 = str(hub.get("key", ""))
-                if not iv_b64:
-                    iv_b64 = str(hub.get("iv", ""))
-                if not root_id:
-                    root_id = str(hub.get("root_id", ""))
+                # Bắt buộc dùng topic và key/iv của irwifiv2 để irwifiv2 nhận và giải mã được
+                hub_topic = str(hub.get("topicsub", hub.get("topic_sub", "")))
+                if hub_topic:
+                    topic = hub_topic
+                hub_key = str(hub.get("key", ""))
+                if hub_key:
+                    key_b64 = hub_key
+                hub_iv = str(hub.get("iv", ""))
+                if hub_iv:
+                    iv_b64 = hub_iv
+                hub_rid = str(hub.get("root_id", ""))
+                if hub_rid:
+                    root_id = hub_rid
                 payload["irwifiv2"] = 0
                 payload.setdefault("irchildv2", 0)
+                if device.get("id"):
+                    payload.setdefault("child_id", device.get("id"))
 
         # Publish lên TẤT CẢ broker của thiết bị (primary + backup)
         brokers = self._device_brokers.get(self._topic_root(topic), []) if topic else []
