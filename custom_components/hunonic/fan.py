@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -284,8 +285,8 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
     - Nhớ trạng thái qua RestoreEntity
     """
 
-    _attr_speed_count = 8
-    _attr_preset_modes = [PRESET_NORMAL, PRESET_NATURAL]
+    _attr_speed_count = 3
+    _attr_preset_modes = [PRESET_LOW, PRESET_MED, PRESET_HIGH, PRESET_NORMAL, PRESET_NATURAL]
     _attr_supported_features = (
         FanEntityFeature.TURN_ON
         | FanEntityFeature.TURN_OFF
@@ -304,7 +305,7 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
 
         # Trạng thái quạt
         self._is_on: bool = False
-        self._speed: int = 1               # 1..8
+        self._speed: int = 1               # 1..3
         self._oscillating: bool = False     # Quay / đảo gió
         self._preset_mode: str = PRESET_NORMAL
 
@@ -340,12 +341,13 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
             self._is_on = (last.state == "on")
 
         attrs = last.attributes
-        # Khôi phục phần trăm / tốc độ
+        # Khôi phục phần trăm / tốc độ (3 nấc: 1=33%, 2=66%, 3=100%)
         if "speed" not in st:
             pct = attrs.get("percentage")
             if pct is not None:
                 try:
-                    self._speed = max(1, min(8, int(round(float(pct) * 8 / 100))))
+                    p = float(pct)
+                    self._speed = 1 if p <= 33 else (2 if p <= 66 else 3)
                 except (TypeError, ValueError):
                     pass
 
@@ -376,7 +378,7 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
             self._is_on = bool(st["power"])
         if "speed" in st:
             try:
-                self._speed = max(1, min(8, int(st["speed"])))
+                self._speed = max(1, min(3, int(st["speed"])))
             except (ValueError, TypeError):
                 pass
         if "oscillating" in st:
@@ -418,7 +420,11 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
         """Tốc độ dạng phần trăm (0..100%)."""
         if not self._is_on:
             return 0
-        return int(round(self._speed * 100 / 8))
+        return 33 if self._speed == 1 else (66 if self._speed == 2 else 100)
+
+    @property
+    def speed_count(self) -> int:
+        return 3
 
     @property
     def oscillating(self) -> bool | None:
@@ -427,7 +433,7 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
 
     @property
     def preset_mode(self) -> str | None:
-        """Chế độ gió (Normal / Natural)."""
+        """Chế độ gió (Normal / Natural / Low / Med / High)."""
         return self._preset_mode if self._is_on else None
 
     @property
@@ -439,29 +445,70 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
             "root_id": self._root_id,
         }
 
+    async def _step_to_speed(self, target_speed: int) -> None:
+        """Nhảy nấc tuần hoàn tới tốc độ đích (1: Thấp, 2: Vừa, 3: Cao) bằng phím speed."""
+        target = max(1, min(3, target_speed))
+        if not self._is_on:
+            await self._send_cmd(IR_FAN_BTN_ON, "powerOn")
+            self._is_on = True
+            cur = 1
+            if target > 1:
+                await asyncio.sleep(0.4)
+                pulses = target - 1
+                for _ in range(pulses):
+                    await self._send_cmd(IR_FAN_BTN_SPEED_UP, "speed")
+                    await asyncio.sleep(0.4)
+        else:
+            cur = self._speed
+            delta = (target - cur) % 3
+            for _ in range(delta):
+                await self._send_cmd(IR_FAN_BTN_SPEED_UP, "speed")
+                await asyncio.sleep(0.4)
+
+        self._speed = target
+        if target == 1:
+            self._preset_mode = PRESET_LOW
+        elif target == 2:
+            self._preset_mode = PRESET_MED
+        elif target == 3:
+            self._preset_mode = PRESET_HIGH
+
+        self._update_coordinator_state()
+        self.async_write_ha_state()
+
     async def async_turn_on(
         self,
         percentage: int | None = None,
         preset_mode: str | None = None,
         **kwargs: Any,
     ) -> None:
-        """Bật quạt IR."""
+        """Bật quạt IR và điều chỉnh tốc độ/chế độ nếu có."""
         if percentage is not None and percentage > 0:
-            speed = max(1, min(8, int(round(percentage * 8 / 100))))
-            self._speed = speed
-            action = _IR_SPEED_TO_ACTION.get(speed, IR_FAN_BTN_ON)
-            await self._send_cmd(action, "speed")
+            target = 1 if percentage <= 33 else (2 if percentage <= 66 else 3)
+            await self._step_to_speed(target)
+        elif preset_mode in (PRESET_LOW, "1"):
+            await self._step_to_speed(1)
+        elif preset_mode in (PRESET_MED, "2"):
+            await self._step_to_speed(2)
+        elif preset_mode in (PRESET_HIGH, "3"):
+            await self._step_to_speed(3)
         elif preset_mode == PRESET_NATURAL:
+            if not self._is_on:
+                await self._send_cmd(IR_FAN_BTN_ON, "powerOn")
+                await asyncio.sleep(0.4)
+            await self._send_cmd(IR_FAN_BTN_NATURAL, "wind")
+            self._is_on = True
             self._preset_mode = PRESET_NATURAL
-            action = IR_FAN_BTN_NATURAL
-            await self._send_cmd(action, "wind")
+            self._update_coordinator_state()
+            self.async_write_ha_state()
         else:
-            action = _IR_SPEED_TO_ACTION.get(self._speed, IR_FAN_BTN_ON)
-            await self._send_cmd(action, "powerOn")
-
-        self._is_on = True
-        self._update_coordinator_state()
-        self.async_write_ha_state()
+            if not self._is_on:
+                await self._send_cmd(IR_FAN_BTN_ON, "powerOn")
+                self._is_on = True
+                self._speed = 1
+                self._preset_mode = PRESET_LOW
+                self._update_coordinator_state()
+                self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Tắt quạt IR."""
@@ -471,18 +518,13 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
         self.async_write_ha_state()
 
     async def async_set_percentage(self, percentage: int) -> None:
-        """Đặt tốc độ quạt (0-100% -> 8 mức)."""
+        """Đặt tốc độ quạt (0-100% qua 3 nấc Thấp/Vừa/Cao)."""
         if percentage == 0:
             await self.async_turn_off()
             return
 
-        speed = max(1, min(8, int(round(percentage * 8 / 100))))
-        self._speed = speed
-        self._is_on = True
-        action = _IR_SPEED_TO_ACTION.get(speed, IR_FAN_BTN_SPD1)
-        await self._send_cmd(action, "speed")
-        self._update_coordinator_state()
-        self.async_write_ha_state()
+        target = 1 if percentage <= 33 else (2 if percentage <= 66 else 3)
+        await self._step_to_speed(target)
 
     async def async_oscillate(self, oscillating: bool) -> None:
         """Bật/tắt quay (gửi nút quay)."""
@@ -492,13 +534,26 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
         self.async_write_ha_state()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Đặt chế độ gió (Normal / Natural)."""
-        self._preset_mode = preset_mode
-        if preset_mode == PRESET_NATURAL:
+        """Đặt chế độ gió hoặc nấc tốc độ (low/medium/high/natural/normal)."""
+        if preset_mode in (PRESET_LOW, "low", "1"):
+            await self._step_to_speed(1)
+        elif preset_mode in (PRESET_MED, "medium", "2"):
+            await self._step_to_speed(2)
+        elif preset_mode in (PRESET_HIGH, "high", "3"):
+            await self._step_to_speed(3)
+        elif preset_mode == PRESET_NATURAL:
+            if not self._is_on:
+                await self._send_cmd(IR_FAN_BTN_ON, "powerOn")
+                await asyncio.sleep(0.4)
             await self._send_cmd(IR_FAN_BTN_NATURAL, "wind")
+            self._is_on = True
+            self._preset_mode = PRESET_NATURAL
+            self._update_coordinator_state()
+            self.async_write_ha_state()
         else:
-            action = _IR_SPEED_TO_ACTION.get(self._speed, IR_FAN_BTN_SPD1)
-            await self._send_cmd(action, "speed")
+            self._preset_mode = PRESET_NORMAL
+            self._update_coordinator_state()
+            self.async_write_ha_state()
         self._update_coordinator_state()
         self.async_write_ha_state()
 
