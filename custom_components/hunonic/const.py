@@ -115,10 +115,11 @@ DOOR_TYPES = [
 FAN_TYPES = ["fanwifi", "fanac", "fandc", "fanacir"]
 LED_TYPES = ["swled", "swledv2", "dled", "duhalled", "radav1", "duhal"]
 
-# RF Chuông cửa (doorbell):
-# rfdb = RF DoorBell — nhận tín hiệu nút bấm RF và phát âm thanh chuông.
-# Hỗ trợ: button "Reo chuông" (gửi action=1), binary_sensor "Có người bấm".
-DOORBELL_TYPES = ["rfdb", "rfdbv2", "rfbell"]
+# RF Chuông cửa & Loa chuông báo (doorbell / chime):
+# rfdb = nút bấm chuông cửa RF
+# hsrf = bộ chuông / loa chuông Hunonic Smart RF cắm điện trong nhà
+CHIME_TYPES = ["hsrf", "hsrfv2"]
+DOORBELL_TYPES = ["rfdb", "rfdbv2", "rfbell", "hsrf", "hsrfv2"]
 
 def channel_of(index_in_root: int) -> int:
     """index_in_root (1-based) -> chỉ số kênh 0-based dùng trong payload."""

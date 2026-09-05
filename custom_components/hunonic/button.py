@@ -21,6 +21,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CHIME_TYPES,
     DOMAIN,
     DOORBELL_TYPES,
     IR_FAN_BTN_NATURAL,
@@ -108,7 +109,8 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
         return self.coordinator.is_device_online(self._device_id)
 
     async def async_press(self) -> None:
-        """Bam nut -> kich hoat chuong keu (gui action=1)."""
+        """Bấm nút -> kích hoạt chuông hiện tại và TẤT CẢ thiết bị hsrf cùng kêu lên."""
+        # 1. Gửi lệnh tới thiết bị hiện tại
         payload: dict[str, Any] = {
             "u": self._uid,
             self._root_type: 0,
@@ -116,11 +118,28 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
             "action": 1,
             "src": 1,
         }
-        ok = await self.coordinator.async_control_device(self._device, payload)
-        if ok:
-            _LOGGER.debug("Chuong %s da reo", self._device.get("name"))
-        else:
-            _LOGGER.warning("Gui lenh reo chuong that bai: %s", self._device.get("name"))
+        await self.coordinator.async_control_device(self._device, payload)
+        _LOGGER.debug("Đã gửi lệnh reo chuông tới: %s", self._device.get("name"))
+
+        # 2. Tìm tất cả thiết bị hsrf (Hunonic Smart RF / Chuông cắm điện) cùng tài khoản
+        devices = (self.coordinator.data or {}).get("devices", [])
+        hsrf_devices = [
+            d for d in devices
+            if d.get("root_type") in CHIME_TYPES
+            and str(d.get("id")) != self._device_id
+        ]
+
+        for hsrf_dev in hsrf_devices:
+            rt = str(hsrf_dev.get("root_type", "hsrf"))
+            hsrf_payload: dict[str, Any] = {
+                "u": self._uid,
+                rt: 0,
+                "act_id": 0,
+                "action": 1,
+                "src": 1,
+            }
+            await self.coordinator.async_control_device(hsrf_dev, hsrf_payload)
+            _LOGGER.info("Đã gửi lệnh reo chuông tới hsrf: %s (id: %s)", hsrf_dev.get("name"), hsrf_dev.get("id"))
 
     @property
     def _uid(self) -> int:
