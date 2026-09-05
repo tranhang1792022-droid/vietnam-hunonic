@@ -7,7 +7,7 @@ from typing import Any
 
 from homeassistant.components.fan import FanEntity, FanEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -326,31 +326,60 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
     async def async_added_to_hass(self) -> None:
         """Khôi phục trạng thái lần trước từ HA."""
         await super().async_added_to_hass()
+        self._sync_from_coordinator_state()
         last = await self.async_get_last_state()
         if last is None:
             return
 
         # Khôi phục bật/tắt
-        self._is_on = (last.state == "on")
+        st = self.coordinator.get_device_state(self._device_id)
+        if "power" not in st:
+            self._is_on = (last.state == "on")
 
         attrs = last.attributes
         # Khôi phục phần trăm / tốc độ
-        pct = attrs.get("percentage")
-        if pct is not None:
-            try:
-                self._speed = max(1, min(8, int(round(float(pct) * 8 / 100))))
-            except (TypeError, ValueError):
-                pass
+        if "speed" not in st:
+            pct = attrs.get("percentage")
+            if pct is not None:
+                try:
+                    self._speed = max(1, min(8, int(round(float(pct) * 8 / 100))))
+                except (TypeError, ValueError):
+                    pass
 
         # Khôi phục quay
-        osc = attrs.get("oscillating")
-        if isinstance(osc, bool):
-            self._oscillating = osc
+        if "oscillating" not in st:
+            osc = attrs.get("oscillating")
+            if isinstance(osc, bool):
+                self._oscillating = osc
 
         # Khôi phục preset mode
-        preset = attrs.get("preset_mode")
-        if preset in self._attr_preset_modes:
-            self._preset_mode = preset
+        if "preset_mode" not in st:
+            preset = attrs.get("preset_mode")
+            if preset in self._attr_preset_modes:
+                self._preset_mode = preset
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Xử lý khi coordinator có dữ liệu mới (từ nút bấm hoặc MQTT)."""
+        self._sync_from_coordinator_state()
+        self.async_write_ha_state()
+
+    def _sync_from_coordinator_state(self) -> None:
+        """Đồng bộ trạng thái từ coordinator state store."""
+        st = self.coordinator.get_device_state(self._device_id)
+        if not st:
+            return
+        if "power" in st:
+            self._is_on = bool(st["power"])
+        if "speed" in st:
+            try:
+                self._speed = max(1, min(8, int(st["speed"])))
+            except (ValueError, TypeError):
+                pass
+        if "oscillating" in st:
+            self._oscillating = bool(st["oscillating"])
+        if "preset_mode" in st:
+            self._preset_mode = str(st["preset_mode"])
 
     @property
     def unique_id(self) -> str:
@@ -428,12 +457,14 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
             await self._send_cmd(action, "powerOn")
 
         self._is_on = True
+        self._update_coordinator_state()
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Tắt quạt IR."""
         self._is_on = False
         await self._send_cmd(IR_FAN_BTN_OFF, "powerOff")
+        self._update_coordinator_state()
         self.async_write_ha_state()
 
     async def async_set_percentage(self, percentage: int) -> None:
@@ -447,12 +478,14 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
         self._is_on = True
         action = _IR_SPEED_TO_ACTION.get(speed, IR_FAN_BTN_SPD1)
         await self._send_cmd(action, "speed")
+        self._update_coordinator_state()
         self.async_write_ha_state()
 
     async def async_oscillate(self, oscillating: bool) -> None:
         """Bật/tắt quay (gửi nút quay)."""
         self._oscillating = oscillating
         await self._send_cmd(IR_FAN_BTN_SWING, "shake")
+        self._update_coordinator_state()
         self.async_write_ha_state()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
@@ -463,7 +496,17 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
         else:
             action = _IR_SPEED_TO_ACTION.get(self._speed, IR_FAN_BTN_SPD1)
             await self._send_cmd(action, "speed")
+        self._update_coordinator_state()
         self.async_write_ha_state()
+
+    def _update_coordinator_state(self) -> None:
+        """Lưu trạng thái vào coordinator cache."""
+        cur = dict(self.coordinator.get_device_state(self._device_id))
+        cur["power"] = 1 if self._is_on else 0
+        cur["speed"] = self._speed
+        cur["oscillating"] = self._oscillating
+        cur["preset_mode"] = self._preset_mode
+        self.coordinator.update_device_state(self._device_id, cur)
 
     async def _send_cmd(self, action: int, btn_key: str | None = None) -> None:
         """Gửi payload điều khiển IR tới thiết bị qua MQTT."""
