@@ -597,18 +597,18 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if hub_rid and hub_rid.lower() != "none":
                     root_id = hub_rid
 
-        # Publish lên tất cả broker khả dụng (cả broker thiết bị và toàn bộ client đang nối)
+        # Sắp xếp danh sách client: ưu tiên broker được gán cho thiết bị, tiếp theo là các broker khác
+        candidate_clients: list[paho.Client] = []
         brokers = self._device_brokers.get(self._topic_root(topic), []) if topic else []
-        target_clients = [
-            self._mqtt_clients[b]
-            for b in brokers
-            if b in self._mqtt_clients and self._mqtt_clients[b].is_connected()
-        ]
-        all_connected = [c for c in self._mqtt_clients.values() if c.is_connected()]
-        # Gom deduplicate tất cả broker
-        clients = list({id(c): c for c in (target_clients + all_connected)}.values())
+        for b in brokers:
+            c = self._mqtt_clients.get(b)
+            if c and c.is_connected() and c not in candidate_clients:
+                candidate_clients.append(c)
+        for c in self._mqtt_clients.values():
+            if c.is_connected() and c not in candidate_clients:
+                candidate_clients.append(c)
 
-        if clients and topic:
+        if candidate_clients and topic:
             raw_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             # Kiểm tra tính hợp lệ của key_b64 và iv_b64
             valid_key_iv = False
@@ -655,13 +655,14 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return False
 
             ok = False
-            for client in clients:
+            # RẤT QUAN TRỌNG: Chỉ gửi tới DUY NHẤT 1 broker thành công để tránh thiết bị nhận lệnh lặp lại 4 lần
+            for client in candidate_clients:
                 if client.publish(topic, payload_bytes, qos=1).rc == paho.MQTT_ERR_SUCCESS:
                     ok = True
+                    break
             if ok:
                 _LOGGER.debug(
-                    "MQTT publish '%s' lên %d broker: %s", device.get("name"),
-                    len(clients), raw_json,
+                    "MQTT publish '%s' thành công: %s", device.get("name"), raw_json
                 )
                 # Cập nhật state tức thì (optimistic) — cả hub root_id, device root_id và device id.
                 orig_rid = str(device.get("root_id", ""))
@@ -813,6 +814,19 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return bool(int(status))
         except (TypeError, ValueError):
             return bool(status)
+
+    # ── Device State Store ───────────────────────────────────────────────────
+
+    def get_device_state(self, device_id: str) -> dict[str, Any]:
+        """Lấy trạng thái thiết bị từ cache (nút bấm, nhiệt độ, quạt, điều hòa...)."""
+        return self._device_state.get(str(device_id), {})
+
+    def update_device_state(self, device_id: str, new_state: dict[str, Any]) -> None:
+        """Cập nhật trạng thái thiết bị vào cache."""
+        did = str(device_id)
+        if did not in self._device_state:
+            self._device_state[did] = {}
+        self._device_state[did].update(new_state)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
