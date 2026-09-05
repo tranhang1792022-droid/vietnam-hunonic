@@ -459,35 +459,39 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _record_channel_state(self, root_id: str, payload: dict[str, Any]) -> None:
         """Cập nhật trạng thái TỪNG KÊNH từ `action`, `turn`, `status`, `power`."""
+        rid = str(root_id)
+        has_act = False
         act = payload.get("action")
         if act is not None:
             try:
                 a = int(act)
                 if a >= 1:
-                    self._channel_state.setdefault(root_id, {})[(a + 1) // 2] = (a % 2 == 1)
+                    self._channel_state.setdefault(rid, {})[(a + 1) // 2] = (a % 2 == 1)
+                    has_act = True
             except (TypeError, ValueError):
                 pass
 
-        turn = payload.get("turn")
-        if turn is not None:
-            try:
-                t = int(turn)
-                self._channel_state.setdefault(root_id, {})[1] = (t == 1)
-            except (TypeError, ValueError):
-                pass
-
-        for p_key in ("power", "status", "sw1"):
-            p_val = payload.get(p_key)
-            if p_val is not None:
+        if not has_act:
+            turn = payload.get("turn")
+            if turn is not None:
                 try:
-                    pv = int(p_val)
-                    self._channel_state.setdefault(root_id, {})[1] = (pv == 1)
+                    t = int(turn)
+                    self._channel_state.setdefault(rid, {})[1] = (t == 1)
                 except (TypeError, ValueError):
                     pass
 
+            for p_key in ("power", "status", "sw1"):
+                p_val = payload.get(p_key)
+                if p_val is not None:
+                    try:
+                        pv = int(p_val)
+                        self._channel_state.setdefault(rid, {})[1] = (pv == 1)
+                    except (TypeError, ValueError):
+                        pass
+
     def get_channel_state(self, root_id: str, channel: int) -> bool | None:
         """Trạng thái ON/OFF của 1 kênh (1-based); None nếu chưa biết."""
-        return self._channel_state.get(root_id, {}).get(channel)
+        return self._channel_state.get(str(root_id), {}).get(channel)
 
     def set_channel_state(self, root_id: str, channel: int, is_on: bool) -> None:
         """Cập nhật optimistic trạng thái bật/tắt của 1 kênh."""
@@ -584,14 +588,15 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except (ValueError, TypeError):
                     payload.setdefault("child_id", device.get("id"))
 
-        # Publish lên broker của thiết bị (primary + backup), fallback các client đang nối
+        # Publish lên broker của thiết bị VÀ tất cả client MQTT đang kết nối
         brokers = self._device_brokers.get(self._topic_root(topic), []) if topic else []
         target_clients = [
             self._mqtt_clients[b]
             for b in brokers
             if b in self._mqtt_clients and self._mqtt_clients[b].is_connected()
         ]
-        clients = target_clients or [c for c in self._mqtt_clients.values() if c.is_connected()]
+        all_connected = [c for c in self._mqtt_clients.values() if c.is_connected()]
+        clients = list({id(c): c for c in (target_clients + all_connected)}.values())
 
         if clients and topic:
             raw_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
