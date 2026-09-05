@@ -323,6 +323,9 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
                     if k and isinstance(v, str) and len(v) > 20:
                         self._button_codes[k] = v
 
+        # Tự động sửa mã xung phím Tăng tốc độ nếu bị lỗi / thiếu xung (Quạt T4)
+        HunonicCoordinator.fix_fan_speed_code(self._button_codes, self._device)
+
     async def async_added_to_hass(self) -> None:
         """Khôi phục trạng thái lần trước từ HA."""
         await super().async_added_to_hass()
@@ -500,13 +503,15 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
         self.async_write_ha_state()
 
     def _update_coordinator_state(self) -> None:
-        """Lưu trạng thái vào coordinator cache."""
+        """Lưu trạng thái vào coordinator cache và đồng bộ tới các Button entity."""
         cur = dict(self.coordinator.get_device_state(self._device_id))
         cur["power"] = 1 if self._is_on else 0
         cur["speed"] = self._speed
         cur["oscillating"] = self._oscillating
         cur["preset_mode"] = self._preset_mode
         self.coordinator.update_device_state(self._device_id, cur)
+        self.coordinator.update_device_state(self._root_id, cur)
+        self.coordinator.async_set_updated_data(self.coordinator.data)
 
     async def _send_cmd(self, action: int, btn_key: str | None = None) -> None:
         """Gửi payload điều khiển IR tới thiết bị qua MQTT."""
@@ -516,16 +521,17 @@ class HunonicIRFan(CoordinatorEntity[HunonicCoordinator], FanEntity, RestoreEnti
         if not code and btn_key == "powerOff":
             code = self._button_codes.get("powerOn") or self._button_codes.get("power")
 
+        uid = self.coordinator.get_device_uid(self._device)
         if code:
             payload: dict[str, Any] = {
                 "irwifiv2": 1,
                 "type": 2,
                 "data": code,
-                "u": int(self.coordinator._user_id or 0),
+                "u": uid,
             }
         else:
             payload = {
-                "u": int(self.coordinator._user_id or 0),
+                "u": uid,
                 "irwifiv2": 1,
                 self._root_type: 0,
                 "act_id": 0,
