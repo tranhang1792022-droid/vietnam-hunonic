@@ -516,15 +516,19 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     iv_b64 = str(hub.get("iv", ""))
                 if not root_id:
                     root_id = str(hub.get("root_id", ""))
+                payload["irwifiv2"] = 0
+                payload.setdefault("irchildv2", 0)
 
-        # Publish lên TẤT CẢ broker của thiết bị (primary + backup) — thiết bị nối
-        # broker nào trong cặp cũng nhận được; không bị hụt nếu nó ở broker backup.
+        # Publish lên TẤT CẢ broker của thiết bị (primary + backup)
         brokers = self._device_brokers.get(self._topic_root(topic), []) if topic else []
         clients = [
             self._mqtt_clients[b]
             for b in brokers
             if b in self._mqtt_clients and self._mqtt_clients[b].is_connected()
         ]
+        # Nếu broker mapping chưa có, dùng tất cả client MQTT đang kết nối để gửi ngay lập tức
+        if not clients and self._mqtt_clients:
+            clients = [c for c in self._mqtt_clients.values() if c.is_connected()]
 
         if clients and topic:
             raw_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

@@ -1,4 +1,4 @@
-﻿"""Climate entity cho thiết bị IR điều hòa Hunonic (Home Assistant).
+"""Climate entity cho thiết bị IR điều hòa Hunonic (Home Assistant).
 
 Hỗ trợ:
 - Bật/tắt qua HVACMode.OFF
@@ -345,21 +345,35 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
         self._hvac_mode = hvac_mode
         self.async_write_ha_state()
 
+    @property
+    def temperature_unit(self) -> str:
+        """Luôn dùng độ C cho điều hòa."""
+        return UnitOfTemperature.CELSIUS
+
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Đặt nhiệt độ mục tiêu."""
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is None:
             return
-        self._target_temp = float(temp)
+        temp_val = float(temp)
+        # Nếu HA gửi vào độ F (giá trị > 45), tự động đổi về độ C
+        if temp_val > 45:
+            temp_val = (temp_val - 32) * 5 / 9
+        temp_val = max(float(IR_TEMP_MIN), min(float(IR_TEMP_MAX), float(round(temp_val))))
+        self._target_temp = temp_val
+
         # Nếu đang tắt → bật kèm nhiệt độ mới (chế độ cuối)
         hvac = self._hvac_mode if self._hvac_mode != HVACMode.OFF else self._last_hvac_mode
+        if hvac == HVACMode.OFF:
+            hvac = HVACMode.COOL
+        self._hvac_mode = hvac
+        self.async_write_ha_state()
+
         await self._send_on(
             mode=_HVAC_TO_MODE.get(hvac, IR_MODE_COOL),
             temp=self._target_temp,
             fan=_FAN_LABEL_TO_CODE.get(self._fan_mode, IR_FAN_AUTO),
         )
-        self._hvac_mode = hvac
-        self.async_write_ha_state()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Đặt tốc độ quạt."""
