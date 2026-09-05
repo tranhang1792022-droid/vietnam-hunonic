@@ -36,32 +36,9 @@ _IR_AC_TYPES = frozenset(IR_AC_TYPES)
 _TH_TYPES = frozenset(t.lower() for t in TH_TYPES)
 
 
-def _is_th_sensor(device: dict[str, Any]) -> bool:
-    """Kiểm tra thiết bị có phải là cảm biến nhiệt độ / độ ẩm (thswifi, ...)."""
-    candidates = [
-        str(device.get("root_type") or "").lower().strip(),
-        str(device.get("device_type") or "").lower().strip(),
-        str(device.get("dev_type") or "").lower().strip(),
-        str(device.get("type") or "").lower().strip(),
-        str(device.get("model") or "").lower().strip(),
-    ]
-    for c in candidates:
-        if c in _TH_TYPES or any(k in c for k in ("thswifi", "thwifi", "thsensor", "thwswifi", "sensortemp", "swth")):
-            return True
-
-    # Kiểm tra tên thiết bị
-    dev_name = str(device.get("name") or "").lower()
-    if any(k in dev_name for k in ("nhiệt độ", "độ ẩm", "cảm biến nhiệt", "cảm biến ẩm", "nhiet do", "do am")):
-        return True
-
-    # Kiểm tra category
-    cat = device.get("category")
-    if isinstance(cat, dict):
-        cat_name = str(cat.get("name_en") or cat.get("name") or "").lower()
-        if any(k in cat_name for k in ("temp", "th", "humid", "sensor")):
-            return True
-
-    return False
+def _is_th_sensor(root_type: str) -> bool:
+    rt = (root_type or "").lower().strip()
+    return rt in _TH_TYPES or "thswifi" in rt or "thsensor" in rt or "thwifi" in rt
 
 
 async def async_setup_entry(
@@ -93,12 +70,9 @@ async def async_setup_entry(
             ents.append(HunonicACTempSensor(coordinator, device))
             ents.append(HunonicACFanSensor(coordinator, device))
         # Cảm biến nhiệt độ & độ ẩm (thswifi, thwifi, ...)
-        if _is_th_sensor(device):
+        if _is_th_sensor(root_type):
             ents.append(HunonicTemperatureSensor(coordinator, device))
             ents.append(HunonicHumiditySensor(coordinator, device))
-            ents.append(HunonicBatterySensor(coordinator, device))
-        # Chuông cửa RF (rfdb / rfchild / doorbell) - cảm biến % pin theo yêu cầu
-        elif root_type in ("rfdb", "rfchild", "rfbell", "doorbell") or "chuông" in str(device.get("name", "")).lower():
             ents.append(HunonicBatterySensor(coordinator, device))
         # Sensor chẩn đoán cấp THIẾT BỊ (chung mọi nút) — chỉ tạo 1 lần ở kênh 1.
         if str(device.get("index_in_root", "1")) == "1":
@@ -632,20 +606,6 @@ class _HunonicTHBase(_HunonicSensorBase):
                             if val is not None:
                                 return val
 
-            # Kiểm tra 'meta' list (danh sách dict {"meta_key": ..., "value": ...})
-            for m in raw.get("meta", []) or []:
-                if isinstance(m, dict):
-                    mk = str(m.get("meta_key", "")).lower()
-                    if any(k in mk for k in keys):
-                        val = self._try_parse_float(m.get("value"))
-                        if val is not None:
-                            return val
-
-            # Kiểm tra trực tiếp 'value' nếu là số đơn (nhiệt độ)
-            val_direct = self._try_parse_float(val_field)
-            if val_direct is not None and len(keys) > 0 and keys[0] in ("temp", "temperature", "t"):
-                return val_direct
-
         return None
 
     def _extract_from_delimited_value(self, index: int) -> float | None:
@@ -798,22 +758,17 @@ class HunonicBatterySensor(_HunonicTHBase):
 
     @property
     def native_value(self) -> int | None:
-        val = self._extract_number("battery", "bat", "pin", "val_pin", "val_bat", "percentage", "power_bat", "battery_level")
+        val = self._extract_number("battery", "bat", "pin", "val_pin", "val_bat", "percentage", "power_bat")
         if val is not None:
             if val > 100:
                 if 2000 <= val <= 3300:
                     return max(0, min(100, int((val - 2000) / 13)))
             return max(0, min(100, int(val)))
-        # Nếu là thiết bị rfdb (chuông cửa), mặc định hiển thị 100% nếu pin chưa báo yếu
-        if self._root_type in ("rfdb", "rfchild", "doorbell") or "chuông" in str(self._device.get("name", "")).lower():
-            return 100
         return None
 
     @property
     def entity_registry_enabled_default(self) -> bool:
-        """Bật mặc định cho chuông cửa rfdb và cảm biến có mức pin."""
-        if self._root_type in ("rfdb", "rfchild", "doorbell") or "chuông" in str(self._device.get("name", "")).lower():
-            return True
+        """Chỉ bật mặc định nếu thiết bị thực sự có thông số pin."""
         return self.native_value is not None
 
 
