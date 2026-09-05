@@ -215,8 +215,23 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
                     pass
 
     def _parse_remote_profile(self) -> None:
-        """Đọc bảng mã mode/fan/temp từ remote profile của chính thiết bị (Daikin, Funiki...)."""
-        rem = self._device.get("remote")
+        """Đọc bảng mã mode/fan/temp từ remote profile của chính thiết bị (Daikin, Midea...)."""
+        name_upper = str(self._device.get("name") or "").upper()
+        # Điều hòa T2 thực tế là Midea Msafg-13CRN8 (brand 1934, remote 227)
+        if self._device_id == "2941402" or "ĐIỀU HOÀ T2" in name_upper or "ĐIỀU HÒA T2" in name_upper:
+            self._device["brand"] = {"id": 1934, "category_id": "1", "name_en": "midea", "model": "MSAFG-13CRN8"}
+            rem = [
+                {"key_name": "temp_min", "key_value": "16"},
+                {"key_name": "temp_max", "key_value": "30"},
+                {"key_name": "on", "key_value": "1"},
+                {"key_name": "off", "key_value": "0"},
+                {"key_name": "mode", "key_value": '[{"name":"auto","code":2},{"name":"dry","code":2},{"name":"cool","code":0},{"name":"fan","code":4},{"name":"heat","code":3}]'},
+                {"key_name": "fan", "key_value": '[{"name":"min","code":1},{"name":"med","code":2},{"name":"max","code":3},{"name":"auto","code":0}]'},
+            ]
+            self._device["remote"] = rem
+        else:
+            rem = self._device.get("remote")
+
         if not rem or not isinstance(rem, list):
             return
 
@@ -625,8 +640,16 @@ class HunonicIRClimate(CoordinatorEntity[HunonicCoordinator], ClimateEntity, Res
             self._root_type: 0,
             "act_id": 0,
             "action": 2,
+            "power": 0,
             "src": 1,
         }
+        b_info = self._device.get("brand")
+        if isinstance(b_info, dict) and b_info.get("id"):
+            try:
+                payload["brand"] = int(b_info["id"])
+            except (ValueError, TypeError):
+                payload["brand"] = b_info["id"]
+
         dev_id = self._device.get("id")
         if dev_id:
             try:
