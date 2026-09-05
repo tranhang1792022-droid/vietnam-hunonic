@@ -115,36 +115,26 @@ class HunonicSwitch(CoordinatorEntity[HunonicCoordinator], SwitchEntity):
         return self.coordinator.is_device_online(self._device_id)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Bật đúng kênh này tức thì."""
-        self.coordinator.set_channel_state(self._root_id, self._index, True)
-        self.async_write_ha_state()
-        success = await self.coordinator.async_control_device(self._device, self._cmd(True))
-        if not success:
-            self.coordinator.set_channel_state(self._root_id, self._index, False)
-            self.async_write_ha_state()
+        """Bật đúng kênh này."""
+        await self.coordinator.async_control_device(self._device, self._cmd(True))
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Tắt đúng kênh này tức thì."""
-        self.coordinator.set_channel_state(self._root_id, self._index, False)
-        self.async_write_ha_state()
-        success = await self.coordinator.async_control_device(self._device, self._cmd(False))
-        if not success:
-            self.coordinator.set_channel_state(self._root_id, self._index, True)
-            self.async_write_ha_state()
+        """Tắt đúng kênh này."""
+        await self.coordinator.async_control_device(self._device, self._cmd(False))
 
     def _cmd(self, on: bool) -> dict[str, Any]:
         """Payload điều khiển công tắc (đa kênh).
 
-        Bao gồm đầy đủ action (1/2, 3/4...), turn (1/2), channel và src: 1
-        đáp ứng mọi phiên bản firmware Hunonic.
+        Khác bản cũ (sai với công tắc đôi/ba): field `<root_type>` là HẰNG SỐ 0
+        (SWITCH_CONTROL_DEVICE), còn KÊNH được mã hóa trong `action`:
+          kênh N → BẬT = 2N-1, TẮT = 2N  (kênh1: 1/2, kênh2: 3/4, kênh3: 5/6).
+        Code cũ để channel vào field + action 1/2 nên bật kênh 2/3 lại gửi nhầm
+        thành lệnh kênh 1 ("bật nút này tắt nút kia").
         """
         action = (2 * self._index - 1) if on else (2 * self._index)
-        turn = 1 if on else 2
         return {
             "u": int(self.coordinator._user_id or 0),
-            self._root_type: max(0, self._index - 1),
+            self._root_type: 0,  # SWITCH_CONTROL_DEVICE (hằng số), KHÔNG phải channel
             "act_id": 0,
             "action": action,
-            "turn": turn,
-            "src": 1,
         }
