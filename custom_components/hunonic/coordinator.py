@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -320,7 +321,10 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 brokers = await self.api._fetch_mqtt_brokers(root_id, root_type)
             except Exception:  # noqa: BLE001
                 brokers = []
-            hosts = [b["host"] for b in brokers] or [MQTT_BROKER]
+            hosts = [b["host"] for b in brokers]
+            for fallback in ("103.109.43.24", "123.30.48.196"):
+                if fallback not in hosts:
+                    hosts.append(fallback)
             return root_id, hosts
 
         for root_id, hosts in await asyncio.gather(
@@ -500,6 +504,17 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         raw_key = device.get("key")
         raw_iv = device.get("iv")
+        if not raw_key or not raw_iv:
+            dev_id = str(device.get("id", ""))
+            if dev_id and dev_id in self._device_index:
+                raw_key = raw_key or self._device_index[dev_id].get("key")
+                raw_iv = raw_iv or self._device_index[dev_id].get("iv")
+        if not raw_key or not raw_iv:
+            for d in (self.data or {}).get("devices", []):
+                if str(d.get("root_id", "")) == root_id and d.get("key") and d.get("iv"):
+                    raw_key = d.get("key")
+                    raw_iv = d.get("iv")
+                    break
         key_b64 = str(raw_key).strip() if raw_key and str(raw_key).strip().lower() != "none" else ""
         iv_b64 = str(raw_iv).strip() if raw_iv and str(raw_iv).strip().lower() != "none" else ""
 
@@ -579,7 +594,10 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     i_bytes = base64.b64decode(iv_b64)
                     if len(k_bytes) in (16, 24, 32) and len(i_bytes) == 16:
                         valid_key_iv = True
-                except Exception:
+                    else:
+                        _LOGGER.warning("Key/IV length invalid for %s: key_len=%s iv_len=%s", device.get("name"), len(k_bytes), len(i_bytes))
+                except Exception as ex:
+                    _LOGGER.warning("Decode Key/IV error for %s: %s", device.get("name"), ex)
                     valid_key_iv = False
 
             try:
