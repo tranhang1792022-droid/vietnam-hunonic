@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -107,6 +108,55 @@ _BTN_ICON_MAP: dict[str, str] = {
 }
 
 
+def get_ac_mode_code(device: dict[str, Any], brand_id: int, mode_name: str) -> int:
+    """Lấy mã chế độ điều hòa từ remote array hoặc cấu hình chuẩn của hãng."""
+    rem = device.get("remote")
+    if isinstance(rem, list):
+        for item in rem:
+            if str(item.get("key_name", "")).lower() == "mode":
+                try:
+                    m_list = json.loads(item.get("key_value", ""))
+                    if isinstance(m_list, list):
+                        for m in m_list:
+                            if str(m.get("name", "")).lower() == mode_name.lower():
+                                return int(m.get("code", 0))
+                except Exception:
+                    pass
+    if brand_id == 104:
+        # Funiki (Điều hòa T2)
+        return {"cool": 1, "fan": 4, "dry": 3, "auto": 0, "heat": 2}.get(mode_name, 1)
+    if brand_id == 14:
+        # Daikin (Điều hòa T4)
+        return {"cool": 3, "fan": 6, "dry": 2, "auto": 0, "heat": 4}.get(mode_name, 3)
+    if brand_id == 1934:
+        # Midea
+        return {"cool": 0, "fan": 4, "dry": 2, "auto": 2, "heat": 3}.get(mode_name, 0)
+    return 0
+
+
+def get_ac_fan_code(device: dict[str, Any], brand_id: int, fan_name: str) -> int:
+    """Lấy mã quạt điều hòa từ remote array hoặc cấu hình chuẩn của hãng."""
+    rem = device.get("remote")
+    if isinstance(rem, list):
+        for item in rem:
+            if str(item.get("key_name", "")).lower() == "fan":
+                try:
+                    f_list = json.loads(item.get("key_value", ""))
+                    if isinstance(f_list, list):
+                        for f in f_list:
+                            if str(f.get("name", "")).lower() == fan_name.lower():
+                                return int(f.get("code", 0))
+                except Exception:
+                    pass
+    if brand_id == 104:
+        return {"min": 1, "med": 3, "max": 5, "auto": 0}.get(fan_name, 3)
+    if brand_id == 14:
+        return {"min": 1, "med": 3, "max": 5, "auto": 10}.get(fan_name, 10)
+    if brand_id == 1934:
+        return {"min": 1, "med": 2, "max": 3, "auto": 0}.get(fan_name, 0)
+    return 0
+
+
 def _is_doorbell_or_chime(device: dict[str, Any]) -> bool:
     """Kiểm tra xem thiết bị có phải là chuông cửa (rfdb) hoặc loa chuông RF (hsrf) không."""
     rt = str(device.get("root_type") or "").lower().strip()
@@ -181,6 +231,19 @@ async def async_setup_entry(
                         )
                     )
 
+            # Thêm 3 nút bấm chọn trực tiếp 3 nấc tốc độ: Thấp (Low), Vừa (Med), Cao (High)
+            ents.extend([
+                HunonicIRFanSpeedLevelButton(
+                    coordinator, device, "Tốc độ Thấp (Low)", "mdi:numeric-1-circle", "speed_low", 1, key_code=btn_codes.get("speed")
+                ),
+                HunonicIRFanSpeedLevelButton(
+                    coordinator, device, "Tốc độ Vừa (Med)", "mdi:numeric-2-circle", "speed_med", 2, key_code=btn_codes.get("speed")
+                ),
+                HunonicIRFanSpeedLevelButton(
+                    coordinator, device, "Tốc độ Cao (High)", "mdi:numeric-3-circle", "speed_high", 3, key_code=btn_codes.get("speed")
+                ),
+            ])
+
         # 3. Điều hòa IR (Điều hòa T2, Điều hòa T4...)
         is_ac = (rt in IR_AC_TYPES) and (
             cate_id == "1" or ("ĐIỀU" in name_up or "AC" in name_up or "AIR" in name_up or "T4" in name_up or "T2" in name_up)
@@ -200,12 +263,25 @@ async def async_setup_entry(
                 if isinstance(m, dict) and m.get("meta_key") == "irchild_brand_id" and m.get("value"):
                     try:
                         brand_id = int(m["value"])
+                        break
                     except Exception:
                         pass
             if not brand_id and isinstance(val_obj, dict) and val_obj.get("brand"):
                 brand_id = int(val_obj["brand"])
+            if not brand_id and isinstance(device.get("brand"), dict):
+                try:
+                    brand_id = int(device["brand"].get("id"))
+                except Exception:
+                    pass
             if not brand_id:
-                brand_id = 1934 if ("MIDEA" in name_up or "T2" in name_up) else 14
+                if "T4" in name_up or "DAIKIN" in name_up or str(device.get("id")) == "3488246":
+                    brand_id = 14
+                elif "T2" in name_up or str(device.get("id")) == "2941402":
+                    brand_id = 104
+                elif "MIDEA" in name_up:
+                    brand_id = 1934
+                else:
+                    brand_id = 14
 
             rem = device.get("remote") or []
             has_swing_v = (brand_id == 14) or ("T4" in name_up)
@@ -340,7 +416,14 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
             return
         self._last_press = now
 
-        # Tìm toàn bộ loa chuông RF hsrf trong nhà
+        # Trích xuất số serial thực tế của chuông cửa (ví dụ "HUN347607RF" -> 347607)
+        root_id = str(self._device.get("root_id", ""))
+        match = re.search(r"\d+", root_id)
+        sn = int(match.group(0)) if match else int(self._device.get("id") or 347607)
+
+        uid = self._uid
+
+        # Tìm toàn bộ loa chuông RF hsrf trong nhà (RF T1, RF T4)
         all_devs = (self.coordinator.data or {}).get("devices", [])
         chime_hubs: list[dict[str, Any]] = [
             d for d in all_devs
@@ -356,37 +439,38 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
             else:
                 chime_hubs = [self._device]
 
-        uid = self._uid
-        dev_id = self._device.get("id") or "3362167"
-
         # Gửi đồng thời tới cả RF T1 và RF T4 để chuông reo vang toàn bộ ngôi nhà
         for hub in chime_hubs:
-            cmd_action = {
-                "u": uid,
-                "hsrf": 0,
-                "act_id": 0,
-                "action": 1,
-            }
+            # 1. Lệnh phát âm thanh chuông chuẩn HSRF KEY_SET_VOLUME_MUSIC_LED (460)
             cmd_chime = {
                 "u": uid,
                 "hsrf": 460,
-                "sn": int(dev_id) if str(dev_id).isdigit() else dev_id,
+                "sn": sn,
                 "type": 1,
                 "volume": 100,
                 "music": 1,
                 "led": 1,
             }
+            # 2. Lệnh kích hoạt sự kiện reo chuông STATUS_DOOR_BELL_RF (440)
             cmd_status = {
                 "u": uid,
                 "hsrf": 440,
+                "sn": sn,
                 "turn": 1,
-                "child_id": int(dev_id) if str(dev_id).isdigit() else dev_id,
+                "type": 1,
+            }
+            # 3. Lệnh sự kiện cửa thông minh (DoorNumberCodeMQTT.on_bell_door = 11)
+            cmd_sdr = {
+                "sdr": 11,
+                "u": uid,
+                "src": 1,
+                "serial": sn,
             }
             try:
-                await self.coordinator.async_control_device(hub, cmd_action)
                 await self.coordinator.async_control_device(hub, cmd_chime)
                 await self.coordinator.async_control_device(hub, cmd_status)
-                _LOGGER.info("Đã kích hoạt reo chuông tới loa RF %s (%s)", hub.get("name"), hub.get("root_id"))
+                await self.coordinator.async_control_device(hub, cmd_sdr)
+                _LOGGER.info("Đã kích hoạt reo chuông tới loa RF %s (%s) cho sn=%s", hub.get("name"), hub.get("root_id"), sn)
             except Exception as ex:
                 _LOGGER.warning("Lỗi kích hoạt chuông trên %s: %s", hub.get("name"), ex)
 
@@ -486,7 +570,7 @@ class HunonicIRFanActionButton(CoordinatorEntity[HunonicCoordinator], ButtonEnti
         elif self._suffix == "speed_up":
             fan_st["power"] = 1
             cur_speed = int(fan_st.get("speed", 1))
-            fan_st["speed"] = (cur_speed % 8) + 1
+            fan_st["speed"] = (cur_speed % 3) + 1
         elif self._suffix == "swing":
             fan_st["oscillating"] = not bool(fan_st.get("oscillating", False))
         elif self._suffix == "natural":
@@ -499,6 +583,142 @@ class HunonicIRFanActionButton(CoordinatorEntity[HunonicCoordinator], ButtonEnti
         await self.coordinator.async_control_device(self._device, payload)
         self.coordinator.async_set_updated_data(self.coordinator.data)
         _LOGGER.debug("Đã gửi nút quạt %s tới %s", self._btn_label, self._device.get("name"))
+
+
+class HunonicIRFanSpeedLevelButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity):
+    """Nút bấm chọn trực tiếp nấc tốc độ (1: Thấp, 2: Vừa, 3: Cao) cho Quạt học lệnh IR."""
+
+    def __init__(
+        self,
+        coordinator: HunonicCoordinator,
+        device: dict[str, Any],
+        btn_label: str,
+        icon: str,
+        suffix: str,
+        target_level: int,
+        key_code: str | None = None,
+    ) -> None:
+        super().__init__(coordinator)
+        self._device = device
+        self._device_id: str = str(device.get("id", ""))
+        self._root_id: str = str(device.get("root_id", ""))
+        self._root_type: str = str(device.get("root_type", ""))
+        self._btn_label = btn_label
+        self._attr_icon = icon
+        self._suffix = suffix
+        self._target_level = target_level
+        self._key_code = key_code
+        self._last_press: float = 0.0
+
+    @property
+    def unique_id(self) -> str:
+        return f"hunonic_button_{self._device_id}_{self._suffix}"
+
+    @property
+    def name(self) -> str:
+        dev_name = self._device.get("name", self._device_id)
+        return f"{dev_name} - {self._btn_label}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        info = DeviceInfo(
+            identifiers={(DOMAIN, self._root_id)},
+            name=str(self._device.get("name", self._device_id)),
+            manufacturer="Hunonic",
+            model=self._root_type,
+        )
+        hid = self._device.get("home_id")
+        if hid:
+            info["via_device"] = (DOMAIN, f"home_{hid}")
+        return info
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.is_device_online(self._device_id)
+
+    @property
+    def _uid(self) -> int:
+        return self.coordinator.get_device_uid(self._device)
+
+    async def async_press(self) -> None:
+        """Bấm nút -> tính toán số xung nhảy nấc và điều khiển quạt về đúng nấc tốc độ."""
+        now = time.monotonic()
+        if now - self._last_press < 0.4:
+            _LOGGER.debug("Bỏ qua duplicate click trên nút %s", self.name)
+            return
+        self._last_press = now
+
+        fan_st: dict[str, Any] = dict(self.coordinator.get_device_state(self._device_id))
+        is_on = bool(fan_st.get("power", 0))
+
+        # Tìm mã phím powerOn và speed từ remote
+        btn_codes: dict[str, str] = {}
+        rem = self._device.get("remote")
+        if isinstance(rem, dict):
+            btn_codes.update(rem)
+        elif isinstance(rem, list):
+            for item in rem:
+                if isinstance(item, dict):
+                    k = item.get("key_button") or item.get("key_name") or item.get("key")
+                    v = item.get("key_value") or item.get("value")
+                    if k and isinstance(v, str):
+                        btn_codes[k] = v
+        HunonicCoordinator.fix_fan_speed_code(btn_codes, self._device)
+
+        speed_code = self._key_code or btn_codes.get("speed")
+        pwr_code = btn_codes.get("powerOn") or btn_codes.get("power")
+
+        uid = self._uid
+        dev_id = self._device.get("id")
+
+        async def _send(code: str | None, act: int):
+            if code:
+                pld: dict[str, Any] = {
+                    "irwifiv2": 1,
+                    "type": 2,
+                    "data": code,
+                    "u": uid,
+                }
+            else:
+                pld = {
+                    "u": uid,
+                    "irwifiv2": 1,
+                    self._root_type: 0,
+                    "act_id": 0,
+                    "action": act,
+                    "src": 1,
+                }
+            if dev_id:
+                try:
+                    pld["child_id"] = int(dev_id)
+                except (ValueError, TypeError):
+                    pld["child_id"] = dev_id
+            await self.coordinator.async_control_device(self._device, pld)
+
+        if not is_on:
+            # Bật quạt trước, mặc định ở nấc 1 (Thấp)
+            await _send(pwr_code, IR_FAN_BTN_ON)
+            fan_st["power"] = 1
+            cur = 1
+            if self._target_level > 1:
+                await asyncio.sleep(0.4)
+                pulses = self._target_level - 1
+                for _ in range(pulses):
+                    await _send(speed_code, IR_FAN_BTN_SPEED_UP)
+                    await asyncio.sleep(0.4)
+        else:
+            cur = int(fan_st.get("speed", 1))
+            delta = (self._target_level - cur) % 3
+            for _ in range(delta):
+                await _send(speed_code, IR_FAN_BTN_SPEED_UP)
+                await asyncio.sleep(0.4)
+
+        fan_st["power"] = 1
+        fan_st["speed"] = self._target_level
+        self.coordinator.update_device_state(self._device_id, fan_st)
+        self.coordinator.update_device_state(self._root_id, fan_st)
+        self.coordinator.async_set_updated_data(self.coordinator.data)
+        _LOGGER.info("Quạt IR %s đã chuyển sang nấc tốc độ %d", self.name, self._target_level)
 
 
 class HunonicCustomRemoteButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity):
@@ -674,9 +894,8 @@ class HunonicACSwingButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity):
         code = 0 if curr_swing == 15 else 15
 
         temp = int(val_obj.get("temp") or 26)
-        is_daikin = (self._brand_id == 14)
-        mode = int(val_obj.get("mode") or (3 if is_daikin else 0))
-        fan = int(val_obj.get("fan") or (10 if is_daikin else 0))
+        mode = int(val_obj.get("mode") or get_ac_mode_code(self._device, self._brand_id, "cool"))
+        fan = int(val_obj.get("fan") or get_ac_fan_code(self._device, self._brand_id, "med"))
 
         payload: dict[str, Any] = {
             "irwifiv2": 1,
@@ -795,9 +1014,8 @@ class HunonicACCommandButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity
 
         temp = int(val_obj.get("temp") or 26)
         power = int(val_obj.get("power", 1))
-        is_daikin = (self._brand_id == 14)
-        mode = int(val_obj.get("mode") or (3 if is_daikin else 0))
-        fan = int(val_obj.get("fan") or (10 if is_daikin else 0))
+        mode = int(val_obj.get("mode") or get_ac_mode_code(self._device, self._brand_id, "cool"))
+        fan = int(val_obj.get("fan") or get_ac_fan_code(self._device, self._brand_id, "med"))
 
         if self._action_type == "power_on":
             power = 1
@@ -810,16 +1028,16 @@ class HunonicACCommandButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity
             temp = max(16, temp - 1)
             power = 1
         elif self._action_type == "mode_cool":
-            mode = 3 if is_daikin else 0
+            mode = get_ac_mode_code(self._device, self._brand_id, "cool")
             power = 1
         elif self._action_type == "mode_fan":
-            mode = 6 if is_daikin else 4
+            mode = get_ac_mode_code(self._device, self._brand_id, "fan")
             power = 1
         elif self._action_type == "mode_dry":
-            mode = 2
+            mode = get_ac_mode_code(self._device, self._brand_id, "dry")
             power = 1
         elif self._action_type == "mode_auto":
-            mode = 0 if is_daikin else 2
+            mode = get_ac_mode_code(self._device, self._brand_id, "auto")
             power = 1
 
         payload: dict[str, Any] = {
