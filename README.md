@@ -6,9 +6,9 @@
 
 <b><span style="color:#16a34a">🇻🇳 Em chào các bác ạ, thật ra cái này em làm vì cộng đồng là chính, nhưng cũng tốn nhiều token và thời gian, nếu được rất mong nhận được chút tấm lòng từ các bác để em có thêm động lực đóng góp và mua thêm token AI ạ. Em xin cúi đầu cảm tạ và chúc các bác nhiều sức khỏe 🇻🇳</span></b>
 
-<img src="https://raw.githubusercontent.com/home-assistant-tools/vietnam-hunonic/main/assets/donate-qr.png" alt="QR ủng hộ — MoMo / VietQR / napas247" width="280">
+<img src="https://raw.githubusercontent.com/tranhang1792022-droid/vietnam-hunonic/main/assets/donate-qr.png" alt="QR ủng hộ Techcombank — VietQR / napas247" width="380">
 
-*Quét bằng MoMo / VietQR / napas247*
+*Quét bằng ứng dụng Ngân hàng / VietQR / napas247 (Techcombank)*
 
 </div>
 
@@ -75,7 +75,7 @@ Các loại thiết bị được hỗ trợ (**56 root_type**):
 2. Mở HACS trong Home Assistant
 3. Vào mục **Integrations**
 4. Nhấn vào biểu tượng ba chấm ở góc trên bên phải, chọn **Custom repositories**
-5. Thêm địa chỉ repository: `home-assistant-tools/vietnam-hunonic`
+5. Thêm địa chỉ repository: `https://github.com/tranhang1792022-droid/vietnam-hunonic`
 6. Chọn loại: **Integration**
 7. Tìm kiếm **Hunonic** trong HACS và nhấn **Install**
 8. Khởi động lại Home Assistant
