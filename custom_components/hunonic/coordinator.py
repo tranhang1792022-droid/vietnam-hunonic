@@ -63,6 +63,7 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         hass: HomeAssistant,
         session: aiohttp.ClientSession,
         entry_data: dict[str, Any],
+        entry: Any = None,
     ) -> None:
         super().__init__(
             hass,
@@ -71,6 +72,8 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=timedelta(seconds=SCAN_INTERVAL),
         )
         self._session = session
+        self._entry = entry
+        self._entry_data = entry_data
         # 1 entry = 1 TÀI KHOẢN → nạp TẤT CẢ nhà (gồm nhà được share). home_id chỉ còn
         # để tương thích entry cũ (1-nhà); việc fetch dùng home_id rỗng = mọi nhà.
         self._home_id = str(entry_data.get(CONF_HOME_ID, ""))
@@ -125,15 +128,25 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             devices = await self._fetch_devices()
         except HunonicAuthError as exc:
             # token_id hết hạn → đăng nhập lại bằng credential đã lưu rồi thử lại.
-            if not await self._relogin():
+            if await self._relogin():
+                try:
+                    devices = await self._fetch_devices()
+                except HunonicError as exc2:
+                    _LOGGER.warning("Lỗi fetch thiết bị sau khi đăng nhập lại: %s", exc2)
+            else:
+                _LOGGER.warning("Phiên Hunonic hết hạn (lỗi 40). Đang giữ dữ liệu cache trước đó: %s", exc)
+                if self._device_index:
+                    return {"devices": list(self._device_index.values()), "scenes": []}
                 raise UpdateFailed(f"Token hết hạn, đăng nhập lại thất bại: {exc}") from exc
-            try:
-                devices = await self._fetch_devices()
-            except HunonicError as exc2:
-                raise UpdateFailed(f"Lỗi sau khi đăng nhập lại: {exc2}") from exc2
         except HunonicError as exc:
+            if self._device_index:
+                _LOGGER.warning("Lỗi kết nối Hunonic: %s — giữ cache thiết bị", exc)
+                return {"devices": list(self._device_index.values()), "scenes": []}
             raise UpdateFailed(f"Lỗi kết nối Hunonic: {exc}") from exc
         except aiohttp.ClientError as exc:
+            if self._device_index:
+                _LOGGER.warning("Lỗi mạng HTTP: %s — giữ cache thiết bị", exc)
+                return {"devices": list(self._device_index.values()), "scenes": []}
             raise UpdateFailed(f"Lỗi HTTP: {exc}") from exc
 
         # token_id stale đôi khi trả DANH SÁCH RỖNG mà KHÔNG báo lỗi (không phải
@@ -225,11 +238,21 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self._phone or not self._password:
             return False
         try:
-            await self.api.login_mobile(self._phone, self._password)
+            data = await self.api.login_mobile(self._phone, self._password)
+            new_token = str(data.get("token_id") or self.api.token_id)
+            if new_token:
+                self._entry_data[CONF_TOKEN_ID] = new_token
+                if self._entry:
+                    new_data = dict(self._entry.data)
+                    new_data[CONF_TOKEN_ID] = new_token
+                    self.hass.config_entries.async_update_entry(self._entry, data=new_data)
             _LOGGER.info("Hunonic: đã làm mới token_id sau khi hết hạn")
             return True
         except HunonicError as exc:
             _LOGGER.error("Đăng nhập lại thất bại: %s", exc)
+            return False
+        except Exception as exc:
+            _LOGGER.error("Lỗi không xác định khi đăng nhập lại: %s", exc)
             return False
 
     # ── MQTT Setup ───────────────────────────────────────────────────────────
