@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -36,9 +37,51 @@ _IR_AC_TYPES = frozenset(IR_AC_TYPES)
 _TH_TYPES = frozenset(t.lower() for t in TH_TYPES)
 
 
-def _is_th_sensor(root_type: str) -> bool:
-    rt = (root_type or "").lower().strip()
-    return rt in _TH_TYPES or "thswifi" in rt or "thsensor" in rt or "thwifi" in rt
+def _is_th_sensor(device: Any) -> bool:
+    """Kiểm tra thiết bị có phải cảm biến nhiệt độ & độ ẩm (thswifi, ...)."""
+    if isinstance(device, str):
+        dev_dict = {"root_type": device}
+    elif isinstance(device, dict):
+        dev_dict = device
+    else:
+        return False
+
+    root_type = str(dev_dict.get("root_type") or "").lower().strip()
+    dev_type = str(dev_dict.get("type") or "").lower().strip()
+    root_id = str(dev_dict.get("root_id") or "").lower().strip()
+    model = str(dev_dict.get("model") or "").lower().strip()
+    name = str(dev_dict.get("name") or "").lower().strip()
+
+    if root_type in _TH_TYPES or dev_type in _TH_TYPES or model in _TH_TYPES:
+        return True
+
+    th_keywords = (
+        "thswifi", "thswifiv2", "thwifi", "thsensor", "gach_ths",
+        "gachths", "sensortemp", "thwswifi", "swth", "ths",
+    )
+    for kw in th_keywords:
+        if kw in root_type or kw in dev_type or kw in root_id or kw in model:
+            return True
+
+    # Kiểm tra value có chứa temp hoặc humi
+    val = dev_dict.get("value")
+    if isinstance(val, dict) and any(k in val for k in ("temp", "humi", "temperature", "humidity", "t", "h")):
+        return True
+    if isinstance(val, str) and any(k in val.lower() for k in ('"temp"', '"humi"', '"temperature"', '"humidity"')):
+        return True
+
+    # Kiểm tra data_extra hoặc root_extra
+    extra = dev_dict.get("data_extra") or dev_dict.get("root_extra")
+    if isinstance(extra, dict) and any(k in extra for k in ("temp", "humi", "temperature", "humidity")):
+        return True
+    elif isinstance(extra, str) and any(k in extra.lower() for k in ('"temp"', '"humi"', '"temperature"', '"humidity"')):
+        return True
+
+    # Kiểm tra tên thiết bị nếu có từ khóa cảm biến nhiệt ẩm
+    if any(k in name for k in ("thswifi", "cảm biến nhiệt", "nhiệt ẩm", "nhiệt độ độ ẩm")):
+        return True
+
+    return False
 
 
 async def async_setup_entry(
@@ -70,7 +113,7 @@ async def async_setup_entry(
             ents.append(HunonicACTempSensor(coordinator, device))
             ents.append(HunonicACFanSensor(coordinator, device))
         # Cảm biến nhiệt độ & độ ẩm (thswifi, thwifi, ...)
-        if _is_th_sensor(root_type):
+        if _is_th_sensor(device):
             ents.append(HunonicTemperatureSensor(coordinator, device))
             ents.append(HunonicHumiditySensor(coordinator, device))
             ents.append(HunonicBatterySensor(coordinator, device))
@@ -556,29 +599,40 @@ class HunonicACFanSensor(_HunonicACBase):
 # ── Sensor Cảm biến Nhiệt độ & Độ ẩm (thswifi, ...) ─────────────────────────
 
 class _HunonicTHBase(_HunonicSensorBase):
-    """Base sensor cho cảm biến nhiệt độ & độ ẩm (thswifi)."""
+    """Base sensor cho cảm biến nhiệt độ & độ ẩm (thswifi, ...)."""
 
     def _extract_number(self, *keys: str) -> float | None:
-        """Tìm giá trị số từ MQTT state, REST raw, value, data_extra, root_extra."""
-        # 1. Kiểm tra MQTT state realtime
-        state = self.coordinator.get_device_state(self._root_id)
-        if isinstance(state, dict):
-            for k in keys:
-                if k in state and state[k] is not None:
-                    val = self._try_parse_float(state[k])
-                    if val is not None:
-                        return val
-            for sub_key in ("data", "params", "extra", "val", "data_extra"):
-                sub = state.get(sub_key)
-                if isinstance(sub, dict):
-                    for k in keys:
-                        if k in sub and sub[k] is not None:
-                            val = self._try_parse_float(sub[k])
-                            if val is not None:
-                                return val
+        """Tìm giá trị số từ MQTT state, REST raw, value, data_extra, root_extra, meta."""
+        # 1. Kiểm tra MQTT state realtime (theo cả root_id và device_id)
+        for rid in (self._root_id, self._device_id):
+            if not rid:
+                continue
+            state = self.coordinator.get_device_state(rid)
+            if isinstance(state, dict):
+                for k in keys:
+                    if k in state and state[k] is not None:
+                        val = self._try_parse_float(state[k])
+                        if val is not None:
+                            return val
+                for sub_key in ("data", "params", "extra", "val", "data_extra", "value", "status"):
+                    sub = state.get(sub_key)
+                    if isinstance(sub, dict):
+                        for k in keys:
+                            if k in sub and sub[k] is not None:
+                                val = self._try_parse_float(sub[k])
+                                if val is not None:
+                                    return val
+                    elif isinstance(sub, str):
+                        parsed = self._parse_json_dict(sub)
+                        if isinstance(parsed, dict):
+                            for k in keys:
+                                if k in parsed and parsed[k] is not None:
+                                    val = self._try_parse_float(parsed[k])
+                                    if val is not None:
+                                        return val
 
-        # 2. Kiểm tra device raw từ REST API
-        raw = self.coordinator.get_device_raw(self._device_id)
+        # 2. Kiểm tra device raw từ REST API và self._device
+        raw = self.coordinator.get_device_raw(self._device_id) or self._device
         if isinstance(raw, dict):
             for k in keys:
                 if k in raw and raw[k] is not None:
@@ -596,8 +650,8 @@ class _HunonicTHBase(_HunonicSensorBase):
                         if val is not None:
                             return val
 
-            # Kiểm tra 'data_extra', 'root_extra', 'param', 'params'
-            for extra_field in ("data_extra", "root_extra", "param", "params", "extra"):
+            # Kiểm tra 'data_extra', 'root_extra', 'param', 'params', 'extra'
+            for extra_field in ("data_extra", "root_extra", "param", "params", "extra", "status", "DeviceStatus"):
                 extra_data = self._parse_json_dict(raw.get(extra_field))
                 if isinstance(extra_data, dict):
                     for k in keys:
@@ -606,25 +660,62 @@ class _HunonicTHBase(_HunonicSensorBase):
                             if val is not None:
                                 return val
 
+            # Kiểm tra 'meta' list
+            meta_list = raw.get("meta") or self._device.get("meta")
+            if isinstance(meta_list, list):
+                for m in meta_list:
+                    if isinstance(m, dict) and m.get("meta_key") in keys and m.get("value") is not None:
+                        val = self._try_parse_float(m.get("value"))
+                        if val is not None:
+                            return val
+
         return None
 
-    def _extract_from_delimited_value(self, index: int) -> float | None:
-        """Nếu field value là chuỗi ghép '28.5,65' hoặc '28.5-65', tách theo index."""
-        raw = self.coordinator.get_device_raw(self._device_id)
-        val_field = raw.get("value") if isinstance(raw, dict) else None
-        if val_field is None:
-            state = self.coordinator.get_device_state(self._root_id)
-            val_field = state.get("value") if isinstance(state, dict) else None
-        if val_field is None:
-            return None
-        val_str = str(val_field).strip()
-        for sep in (",", "/", ";", "_", "|", "-"):
-            if sep in val_str:
-                parts = [p.strip() for p in val_str.split(sep) if p.strip()]
-                if len(parts) > index:
-                    val = self._try_parse_float(parts[index])
+    def _extract_from_delimited_value(self, index: int, is_temp: bool = True) -> float | None:
+        """Nếu field value là chuỗi ghép '28.5,65' hoặc '28.5-65', tách theo index hoặc regex."""
+        candidates: list[Any] = []
+        for rid in (self._root_id, self._device_id):
+            if not rid:
+                continue
+            st = self.coordinator.get_device_state(rid)
+            if isinstance(st, dict):
+                if st.get("value") is not None:
+                    candidates.append(st["value"])
+                if st.get("val") is not None:
+                    candidates.append(st["val"])
+
+        raw = self.coordinator.get_device_raw(self._device_id) or self._device
+        if isinstance(raw, dict):
+            if raw.get("value") is not None:
+                candidates.append(raw["value"])
+
+        for val_field in candidates:
+            if val_field is None:
+                continue
+            val_str = str(val_field).strip()
+
+            # Regex trích xuất trực tiếp
+            if is_temp:
+                m = re.search(r'(?:temp|temperature|t|nhiet|nhiệt)[:=\s]*([+-]?\d+(?:\.\d+)?)', val_str, re.I)
+                if m:
+                    val = self._try_parse_float(m.group(1))
                     if val is not None:
                         return val
+            else:
+                m = re.search(r'(?:humi|humidity|hum|h|do_am|độ ẩm)[:=\s]*([+-]?\d+(?:\.\d+)?)', val_str, re.I)
+                if m:
+                    val = self._try_parse_float(m.group(1))
+                    if val is not None:
+                        return val
+
+            # Tách theo ký tự phân cách
+            for sep in (",", "/", ";", "_", "|", "-"):
+                if sep in val_str:
+                    parts = [p.strip() for p in val_str.split(sep) if p.strip()]
+                    if len(parts) > index:
+                        val = self._try_parse_float(parts[index])
+                        if val is not None:
+                            return val
         return None
 
     @staticmethod
@@ -661,7 +752,7 @@ class _HunonicTHBase(_HunonicSensorBase):
             "device_type": self._root_type,
             "root_id": self._root_id,
         }
-        raw = self.coordinator.get_device_raw(self._device_id)
+        raw = self.coordinator.get_device_raw(self._device_id) or self._device
         if isinstance(raw, dict):
             for k in ("battery", "bat", "pin", "voltage", "rssi", "fw_version", "version"):
                 if k in raw and raw[k] is not None:
@@ -693,17 +784,38 @@ class HunonicTemperatureSensor(_HunonicTHBase):
 
     @property
     def native_value(self) -> float | None:
-        val = self._extract_number("temp", "temperature", "t", "val_temp", "val_t", "nhiet_do", "nhietdo")
+        val = self._extract_number(
+            "temp", "temperature", "t", "val_temp", "val_t", "nhiet_do", "nhietdo",
+            "aroundTemp", "sensor_temp", "temperature_current", "temp_current",
+            "celsius", "te", "nd"
+        )
         if val is None:
-            val = self._extract_from_delimited_value(index=0)
+            val = self._extract_from_delimited_value(index=0, is_temp=True)
         if val is not None:
             # Scale nếu phần cứng gửi 285 thay vì 28.5 hoặc 2850 thay vì 28.5
-            if 100 < val <= 1000:
+            if 100 < abs(val) <= 1000:
                 val = val / 10.0
-            elif val > 1000:
+            elif abs(val) > 1000:
                 val = val / 100.0
             return round(val, 1)
         return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = super().extra_state_attributes
+        humi_val = self._extract_number(
+            "humi", "humidity", "hum", "h", "val_humi", "val_hum", "val_h",
+            "do_am", "doam", "aroundHumidity", "sensor_humi"
+        )
+        if humi_val is None:
+            humi_val = self._extract_from_delimited_value(index=1, is_temp=False)
+        if humi_val is not None:
+            if 100 < humi_val <= 1000:
+                humi_val = humi_val / 10.0
+            elif humi_val > 1000:
+                humi_val = humi_val / 100.0
+            attrs["humidity"] = round(max(0.0, min(100.0, humi_val)), 1)
+        return attrs
 
 
 class HunonicHumiditySensor(_HunonicTHBase):
@@ -725,17 +837,39 @@ class HunonicHumiditySensor(_HunonicTHBase):
 
     @property
     def native_value(self) -> float | None:
-        val = self._extract_number("hum", "humidity", "humi", "h", "val_hum", "val_h", "do_am", "doam")
+        val = self._extract_number(
+            "humi", "humidity", "hum", "h", "val_humi", "val_hum", "val_h",
+            "do_am", "doam", "aroundHumidity", "sensor_humi",
+            "humidity_current", "humi_current", "relative_humidity", "rh", "da"
+        )
         if val is None:
-            val = self._extract_from_delimited_value(index=1)
+            val = self._extract_from_delimited_value(index=1, is_temp=False)
         if val is not None:
-            # Scale nếu phần cứng gửi 650 thay vì 65
+            # Scale nếu phần cứng gửi 650 thay vì 65 hoặc 6500 thay vì 65
             if 100 < val <= 1000:
                 val = val / 10.0
             elif val > 1000:
                 val = val / 100.0
+            val = max(0.0, min(100.0, val))
             return round(val, 1)
         return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = super().extra_state_attributes
+        temp_val = self._extract_number(
+            "temp", "temperature", "t", "val_temp", "val_t", "nhiet_do", "nhietdo",
+            "aroundTemp", "sensor_temp"
+        )
+        if temp_val is None:
+            temp_val = self._extract_from_delimited_value(index=0, is_temp=True)
+        if temp_val is not None:
+            if 100 < abs(temp_val) <= 1000:
+                temp_val = temp_val / 10.0
+            elif abs(temp_val) > 1000:
+                temp_val = temp_val / 100.0
+            attrs["temperature"] = round(temp_val, 1)
+        return attrs
 
 
 class HunonicBatterySensor(_HunonicTHBase):
