@@ -163,9 +163,16 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Rebuild indexes. State realtime về trên topicpub (= topicsub + "/ok"),
         # nên index theo topicpub để tra cứu device khi nhận message.
         self._device_index = {str(d.get("id", "")): d for d in devices}
-        self._topic_index = {
-            d["topicpub"]: d for d in devices if d.get("topicpub")
-        }
+        self._topic_index = {}
+        for d in devices:
+            for k in ("topicpub", "topic_pub", "topicsub", "topic_sub"):
+                t = str(d.get(k) or "").strip()
+                if t and t.lower() != "none":
+                    self._topic_index[t] = d
+                    if not t.endswith("/ok"):
+                        self._topic_index[f"{t}/ok"] = d
+                    else:
+                        self._topic_index[t[:-3]] = d
 
         # Tự động trích xuất user_id từ danh sách thiết bị nếu chưa có
         if not self._user_id and devices:
@@ -269,17 +276,29 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _group_topics_by_broker(
         self, devices: list[dict[str, Any]]
     ) -> dict[str, set[str]]:
-        """Gom topicpub của *devices* theo broker (gồm cả backup của mỗi thiết bị)."""
+        """Gom topicpub và topicsub của *devices* theo broker (gồm cả backup của mỗi thiết bị)."""
         from .const import MQTT_BROKER
 
         topics_by_broker: dict[str, set[str]] = {}
         for d in devices:
-            topic = d.get("topicpub")
-            if not topic:
+            pub = str(d.get("topicpub") or d.get("topic_pub") or "").strip()
+            sub = str(d.get("topicsub") or d.get("topic_sub") or "").strip()
+            dev_topics: set[str] = set()
+            if pub and pub.lower() != "none":
+                dev_topics.add(pub)
+                if not pub.endswith("/ok"):
+                    dev_topics.add(f"{pub}/ok")
+            if sub and sub.lower() != "none":
+                dev_topics.add(sub)
+                if not sub.endswith("/ok"):
+                    dev_topics.add(f"{sub}/ok")
+            if not dev_topics:
                 continue
-            brokers = self._device_brokers.get(self._topic_root(topic)) or [MQTT_BROKER]
+
+            ref_topic = pub or sub
+            brokers = self._device_brokers.get(self._topic_root(ref_topic)) or [MQTT_BROKER]
             for broker in brokers:
-                topics_by_broker.setdefault(broker, set()).add(topic)
+                topics_by_broker.setdefault(broker, set()).update(dev_topics)
         return topics_by_broker
 
     async def _ensure_brokers(self, devices: list[dict[str, Any]]) -> None:
@@ -446,6 +465,15 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         device = self._topic_index.get(msg.topic)
         if device is None:
+            parts = msg.topic.split("/")
+            if len(parts) >= 3 and parts[2]:
+                rid = parts[2]
+                for d in (self.data or {}).get("devices", []):
+                    if str(d.get("root_id", "")) == rid:
+                        device = d
+                        self._topic_index[msg.topic] = d
+                        break
+        if device is None:
             return
 
         root_id: str = str(device.get("root_id", ""))
@@ -471,6 +499,13 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if root_id not in self._device_state:
                 self._device_state[root_id] = {}
             self._device_state[root_id].update(state)
+
+            dev_id = str(device.get("id", ""))
+            if dev_id:
+                if dev_id not in self._device_state:
+                    self._device_state[dev_id] = {}
+                self._device_state[dev_id].update(state)
+
             self._record_channel_state(root_id, state)
             _LOGGER.debug("MQTT update root_id=%s state=%s", root_id, state)
             if self._mqtt_loop and self.data:
