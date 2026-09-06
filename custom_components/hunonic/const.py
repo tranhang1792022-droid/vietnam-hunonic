@@ -126,6 +126,7 @@ DOORBELL_TYPES = ["rfdb", "rfdbv2", "rfbell", "hsrf", "hsrfv2"]
 # Cảm biến nhiệt độ & độ ẩm (thswifi, ...)
 TH_TYPES = [
     "thswifi", "thswifiv2", "thwifi", "thsensor", "sensortemp", "thwswifi", "swth", "th",
+    "ths", "gach_ths", "gachths",
 ]
 
 def channel_of(index_in_root: int) -> int:
