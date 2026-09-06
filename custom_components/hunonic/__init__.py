@@ -62,7 +62,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Tạo aiohttp session dùng chung cho REST API
     session = aiohttp.ClientSession()
 
-    coordinator = HunonicCoordinator(hass, session, dict(entry.data))
+    coordinator = HunonicCoordinator(hass, session, dict(entry.data), entry=entry)
 
     # Thực hiện lần poll đầu tiên — ném lỗi nếu không kết nối được
     await coordinator.async_config_entry_first_refresh()
