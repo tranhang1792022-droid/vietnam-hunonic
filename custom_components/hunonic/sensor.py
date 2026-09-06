@@ -9,11 +9,26 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfEnergy, UnitOfPower, UnitOfTemperature
+from homeassistant.const import PERCENTAGE, EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+try:
+    from homeassistant.const import UnitOfTemperature
+    _TEMP_CELSIUS = UnitOfTemperature.CELSIUS
+except ImportError:
+    _TEMP_CELSIUS = "°C"
+
+try:
+    from homeassistant.const import UnitOfEnergy, UnitOfPower
+except ImportError:
+    class UnitOfEnergy:  # type: ignore
+        KILO_WATT_HOUR = "kWh"
+
+    class UnitOfPower:  # type: ignore
+        WATT = "W"
 
 from .const import DOMAIN, DOOR_TYPES, GATE_HUB_TYPES, GATE_TYPES, IR_AC_TYPES, METER_TYPES, TH_TYPES
 from .coordinator import HunonicCoordinator
@@ -38,7 +53,7 @@ _TH_TYPES = frozenset(t.lower() for t in TH_TYPES)
 
 
 def _is_th_sensor(device: Any) -> bool:
-    """Kiểm tra thiết bị có phải cảm biến nhiệt độ & độ ẩm (thswifi, ...)."""
+    """Kiểm tra thiết bị có phải cảm biến nhiệt độ & độ ẩm (thswifi, GACHths, ...)."""
     if isinstance(device, str):
         dev_dict = {"root_type": device}
     elif isinstance(device, dict):
@@ -51,6 +66,7 @@ def _is_th_sensor(device: Any) -> bool:
     root_id = str(dev_dict.get("root_id") or "").lower().strip()
     model = str(dev_dict.get("model") or "").lower().strip()
     name = str(dev_dict.get("name") or "").lower().strip()
+    topic = str(dev_dict.get("topicpub") or dev_dict.get("topicsub") or "").lower().strip()
 
     if root_type in _TH_TYPES or dev_type in _TH_TYPES or model in _TH_TYPES:
         return True
@@ -60,26 +76,40 @@ def _is_th_sensor(device: Any) -> bool:
         "gachths", "sensortemp", "thwswifi", "swth", "ths",
     )
     for kw in th_keywords:
-        if kw in root_type or kw in dev_type or kw in root_id or kw in model:
+        if kw in root_type or kw in dev_type or kw in root_id or kw in model or kw in topic:
             return True
+
+    # Quét toàn bộ chuỗi dev_dict để nhận diện bất kỳ cấu trúc trả về nào
+    try:
+        raw_str = json.dumps(dev_dict, ensure_ascii=False).lower()
+        for kw in ("thswifi", "thwifi", "thsensor", "gachths", "gach_ths", "sensortemp"):
+            if kw in raw_str:
+                return True
+    except Exception:
+        pass
 
     # Kiểm tra value có chứa temp hoặc humi
     val = dev_dict.get("value")
     if isinstance(val, dict) and any(k in val for k in ("temp", "humi", "temperature", "humidity", "t", "h")):
         return True
-    if isinstance(val, str) and any(k in val.lower() for k in ('"temp"', '"humi"', '"temperature"', '"humidity"')):
+    if isinstance(val, str) and any(k in val.lower() for k in ('"temp"', '"humi"', '"temperature"', '"humidity"', 'temp', 'humi')):
         return True
 
     # Kiểm tra data_extra hoặc root_extra
     extra = dev_dict.get("data_extra") or dev_dict.get("root_extra")
     if isinstance(extra, dict) and any(k in extra for k in ("temp", "humi", "temperature", "humidity")):
         return True
-    elif isinstance(extra, str) and any(k in extra.lower() for k in ('"temp"', '"humi"', '"temperature"', '"humidity"')):
+    elif isinstance(extra, str) and any(k in extra.lower() for k in ('"temp"', '"humi"', '"temperature"', '"humidity"', 'temp', 'humi')):
+        return True
+
+    if dev_dict.get("temp") is not None or dev_dict.get("humi") is not None:
         return True
 
     # Kiểm tra tên thiết bị nếu có từ khóa cảm biến nhiệt ẩm
-    if any(k in name for k in ("thswifi", "cảm biến nhiệt", "nhiệt ẩm", "nhiệt độ độ ẩm")):
-        return True
+    if any(k in name for k in ("thswifi", "cảm biến", "nhiệt", "ẩm", "temp", "humi", "sensor")):
+        # Loại trừ các thiết bị không phải cảm biến môi trường
+        if not any(sw in root_type for sw in ("switch", "door", "gate", "camera", "irchild", "rfchild", "fan", "light")):
+            return True
 
     return False
 
@@ -139,6 +169,11 @@ class _HunonicSensorBase(CoordinatorEntity[HunonicCoordinator], SensorEntity):
         self._root_type: str = str(device.get("root_type", ""))
 
     @property
+    def available(self) -> bool:
+        """Sensor Hunonic luôn available nếu device tồn tại, tránh Unavailable khi mạng lag/sleep."""
+        return bool(self._device)
+
+    @property
     def device_info(self) -> DeviceInfo:
         info = DeviceInfo(
             identifiers={(DOMAIN, self._root_id)},
@@ -158,6 +193,11 @@ class HunonicConnectivitySensor(_HunonicSensorBase):
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = ["online", "offline"]
     _attr_icon = "mdi:lan-connect"
+
+    @property
+    def available(self) -> bool:
+        """Sensor kết nối luôn available để báo online/offline chính xác."""
+        return True
 
     @property
     def unique_id(self) -> str:
@@ -601,6 +641,11 @@ class HunonicACFanSensor(_HunonicACBase):
 class _HunonicTHBase(_HunonicSensorBase):
     """Base sensor cho cảm biến nhiệt độ & độ ẩm (thswifi, ...)."""
 
+    @property
+    def available(self) -> bool:
+        """Cảm biến môi trường pin ngủ định kỳ luôn available để Home Assistant hiển thị số đo."""
+        return True
+
     def _extract_number(self, *keys: str) -> float | None:
         """Tìm giá trị số từ MQTT state, REST raw, value, data_extra, root_extra, meta."""
         # 1. Kiểm tra MQTT state realtime (theo cả root_id và device_id)
@@ -770,12 +815,13 @@ class HunonicTemperatureSensor(_HunonicTHBase):
 
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_native_unit_of_measurement = _TEMP_CELSIUS
     _attr_icon = "mdi:thermometer"
 
     @property
     def unique_id(self) -> str:
-        return f"hunonic_sensor_{self._device_id}_temperature"
+        dev_id = self._device_id or self._root_id
+        return f"hunonic_sensor_{dev_id}_temperature"
 
     @property
     def name(self) -> str:
@@ -828,7 +874,8 @@ class HunonicHumiditySensor(_HunonicTHBase):
 
     @property
     def unique_id(self) -> str:
-        return f"hunonic_sensor_{self._device_id}_humidity"
+        dev_id = self._device_id or self._root_id
+        return f"hunonic_sensor_{dev_id}_humidity"
 
     @property
     def name(self) -> str:
@@ -883,7 +930,8 @@ class HunonicBatterySensor(_HunonicTHBase):
 
     @property
     def unique_id(self) -> str:
-        return f"hunonic_sensor_{self._device_id}_battery"
+        dev_id = self._device_id or self._root_id
+        return f"hunonic_sensor_{dev_id}_battery"
 
     @property
     def name(self) -> str:
@@ -902,7 +950,7 @@ class HunonicBatterySensor(_HunonicTHBase):
 
     @property
     def entity_registry_enabled_default(self) -> bool:
-        """Chỉ bật mặc định nếu thiết bị thực sự có thông số pin."""
-        return self.native_value is not None
+        """Bật mặc định cho cảm biến để người dùng theo dõi pin."""
+        return True
 
 
