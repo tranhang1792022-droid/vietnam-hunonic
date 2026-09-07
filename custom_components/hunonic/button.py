@@ -1,10 +1,9 @@
 """Button entity cho chuông cửa RF, quạt IR, điều hòa IR và các remote học lệnh Hunonic.
 
-Bản v1.16.13:
-- Chuông cửa & Loa chuông RF (RF T1, RF T4, Chuông cửa): Sửa triệt để mức âm lượng lớn nhất (volume: 15 / soundHuge trong firmware HSRF).
-- Tự động ghép cặp và đồng bộ mã chuông cửa (sn, type 5 DOOR_BELL) qua toàn bộ loa chuông RF trong nhà.
-- Bấm "Reo chuông" trên HA kích hoạt đồng thời toàn bộ loa chuông trong nhà reo vang ở mức âm lượng cực đại.
-- Nhận tín hiệu chuông cửa vật lý (hsrf: 440) tự động chuyển tiếp tới các loa chuông khác reo đồng loạt.
+Bản v1.16.14:
+- Chuông cửa: Kích hoạt đồng thời toàn bộ loa chuông RF trong nhà reo vang cực đại (volume: 15 / soundHuge).
+- Kích hoạt chuông reo trên ứng dụng điện thoại (App Hunonic qua MQTT topicpub /ok hsrf: 440 & App Home Assistant qua Mobile App notification).
+- Bấm chuông trên HA hoặc bấm nút chuông vật lý ngoài cửa đều kích hoạt đồng thời toàn bộ loa trong nhà và điện thoại reo chuông.
 - Sửa triệt để nút "Tăng tốc độ" Quạt T4: Tự động thay thế mã xung lỗi bằng mã xung chuẩn 262-byte (131 xung).
 - Sửa triệt để thao tác điều khiển trên thẻ Climate (Điều hòa T4 & T2): Thao tác mượt mà trên HA 2024+.
 - Toàn bộ công tắc, đo công suất, đèn, rèm, cảm biến nhiệt ẩm giữ nguyên sự ổn định tuyệt đối.
@@ -447,17 +446,20 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
             else:
                 chime_hubs = [self._device]
 
-        # Gửi đồng thời tới cả RF T1 và RF T4 để chuông reo vang toàn bộ ngôi nhà ở mức lớn nhất
+        # Đánh dấu thời điểm bấm để tránh coordinator nhận lại echo từ broker và lặp thông báo
+        self.coordinator._last_doorbell_ring_time = now
+
+        # 1. Gửi lệnh reo chuông phần cứng mức LỚN NHẤT (volume: 15) tới toàn bộ loa RF trong nhà (RF T1, RF T4)
         for hub in chime_hubs:
-            # 1. Đảm bảo mã chuông cửa sn được ghép cặp trên hub (hsrf: 201)
+            # Đảm bảo mã chuông cửa sn được ghép cặp trên hub (hsrf: 201)
             cmd_pair = {
                 "u": uid,
                 "hsrf": 201,
                 "sn": sn,
                 "type": 5,
             }
-            # 2. Lệnh phát âm thanh chuông mức Cực lớn / Lớn nhất chuẩn HSRF KEY_SET_VOLUME_MUSIC_LED (460)
-            # Theo firmware HSRF: volume 15 = soundHuge (mức âm lượng lớn nhất), music 1 = chuông Ding-Dong, led 1 = nhấp nháy đèn
+            # Lệnh phát âm thanh chuông mức Cực lớn / Lớn nhất chuẩn HSRF KEY_SET_VOLUME_MUSIC_LED (460)
+            # volume 15 = soundHuge (mức âm lượng lớn nhất), music 1 = chuông Ding-Dong, led 1 = nhấp nháy đèn
             cmd_chime = {
                 "u": uid,
                 "hsrf": 460,
@@ -474,7 +476,26 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
             except Exception as ex:
                 _LOGGER.warning("Lỗi kích hoạt chuông trên %s: %s", hub.get("name"), ex)
 
-        # Cập nhật trạng thái reo chuông vào coordinator để automation trên HA bắt được
+        # 2. Gửi sự kiện chuông cửa reo (hsrf: 440) lên topicpub (/ok) của các hub RF
+        # Giúp Server Hunonic và App Hunonic trên điện thoại nhận được sự kiện và reo chuông + đẩy push notification
+        status_doorbell = {
+            "u": uid,
+            "hsrf": 440,
+            "sn": sn,
+            "turn": 1,
+            "type": 5,
+        }
+        for hub in chime_hubs:
+            try:
+                await self.coordinator.async_publish_status(hub, status_doorbell, publish_to_all_brokers=True)
+                _LOGGER.info("Đã gửi trạng thái reo chuông hsrf: 440 lên topicpub của %s", hub.get("name"))
+            except Exception as ex:
+                _LOGGER.warning("Lỗi gửi status hsrf: 440 tới %s: %s", hub.get("name"), ex)
+
+        # 3. Kích hoạt chuông thông báo tới ứng dụng điện thoại Home Assistant (HA Companion App)
+        await self.coordinator.async_notify_doorbell_ring(sn)
+
+        # 4. Cập nhật trạng thái reo chuông vào coordinator để automation trên HA bắt được
         doorbell_rid = f"HUN{sn}RF"
         child_dev_id = str(self._device.get("id", ""))
         self.coordinator._device_state.setdefault(doorbell_rid, {})["turn"] = 1
