@@ -1,13 +1,13 @@
 """Button entity cho chuông cửa RF, quạt IR, điều hòa IR và các remote học lệnh Hunonic.
 
-Bản v1.16.9:
+Bản v1.16.13:
+- Chuông cửa & Loa chuông RF (RF T1, RF T4, Chuông cửa): Sửa triệt để mức âm lượng lớn nhất (volume: 15 / soundHuge trong firmware HSRF).
+- Tự động ghép cặp và đồng bộ mã chuông cửa (sn, type 5 DOOR_BELL) qua toàn bộ loa chuông RF trong nhà.
+- Bấm "Reo chuông" trên HA kích hoạt đồng thời toàn bộ loa chuông trong nhà reo vang ở mức âm lượng cực đại.
+- Nhận tín hiệu chuông cửa vật lý (hsrf: 440) tự động chuyển tiếp tới các loa chuông khác reo đồng loạt.
 - Sửa triệt để nút "Tăng tốc độ" Quạt T4: Tự động thay thế mã xung lỗi bằng mã xung chuẩn 262-byte (131 xung).
-- Quạt thực tế nhận lệnh ngay lập tức, chuyển cấp tốc độ chính xác.
 - Sửa triệt để thao tác điều khiển trên thẻ Climate (Điều hòa T4 & T2): Thao tác mượt mà trên HA 2024+.
-- Đảm bảo UID luôn hợp lệ (fallback từ topic), loại bỏ hoàn toàn lỗi u=0.
-- Khắc phục triệt để lỗi "click 1 lần nhảy 4 lần" và hiện tượng double click.
-- Chuông cửa: bấm "Reo chuông" kích hoạt đồng thời CẢ RF T1 VÀ RF T4 reo vang khắp nhà.
-- Toàn bộ công tắc, đo công suất, đèn, rèm giữ nguyên sự ổn định tuyệt đối.
+- Toàn bộ công tắc, đo công suất, đèn, rèm, cảm biến nhiệt ẩm giữ nguyên sự ổn định tuyệt đối.
 """
 
 from __future__ import annotations
@@ -416,15 +416,23 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
             return
         self._last_press = now
 
-        # Trích xuất số serial thực tế của chuông cửa (ví dụ "HUN347607RF" -> 347607)
-        root_id = str(self._device.get("root_id", ""))
-        match = re.search(r"\d+", root_id)
-        sn = int(match.group(0)) if match else int(self._device.get("id") or 347607)
+        # Trích xuất số serial thực tế của chuông cửa (ưu tiên tìm thiết bị rfdb "HUN347607RF" -> 347607)
+        sn = 347607
+        all_devs = (self.coordinator.data or {}).get("devices", [])
+        for d in all_devs:
+            if str(d.get("root_type", "")).lower() in ("rfdb", "rfbell") or "chuông" in str(d.get("name", "")).lower():
+                m = re.search(r"\d+", str(d.get("root_id", "")))
+                if m:
+                    sn = int(m.group(0))
+                    break
+        if str(self._device.get("root_type", "")).lower() in ("rfdb", "rfbell"):
+            m = re.search(r"\d+", str(self._device.get("root_id", "")))
+            if m:
+                sn = int(m.group(0))
 
         uid = self._uid
 
         # Tìm toàn bộ loa chuông RF hsrf trong nhà (RF T1, RF T4)
-        all_devs = (self.coordinator.data or {}).get("devices", [])
         chime_hubs: list[dict[str, Any]] = [
             d for d in all_devs
             if str(d.get("root_type", "")).lower() in ("hsrf", "hsrfv2", "hsrfwifi")
@@ -439,40 +447,50 @@ class HunonicDoorbellButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity)
             else:
                 chime_hubs = [self._device]
 
-        # Gửi đồng thời tới cả RF T1 và RF T4 để chuông reo vang toàn bộ ngôi nhà
+        # Gửi đồng thời tới cả RF T1 và RF T4 để chuông reo vang toàn bộ ngôi nhà ở mức lớn nhất
         for hub in chime_hubs:
-            # 1. Lệnh phát âm thanh chuông chuẩn HSRF KEY_SET_VOLUME_MUSIC_LED (460)
+            # 1. Đảm bảo mã chuông cửa sn được ghép cặp trên hub (hsrf: 201)
+            cmd_pair = {
+                "u": uid,
+                "hsrf": 201,
+                "sn": sn,
+                "type": 5,
+            }
+            # 2. Lệnh phát âm thanh chuông mức Cực lớn / Lớn nhất chuẩn HSRF KEY_SET_VOLUME_MUSIC_LED (460)
+            # Theo firmware HSRF: volume 15 = soundHuge (mức âm lượng lớn nhất), music 1 = chuông Ding-Dong, led 1 = nhấp nháy đèn
             cmd_chime = {
                 "u": uid,
                 "hsrf": 460,
                 "sn": sn,
-                "type": 1,
-                "volume": 100,
+                "type": 5,
+                "volume": 15,
                 "music": 1,
                 "led": 1,
             }
-            # 2. Lệnh kích hoạt sự kiện reo chuông STATUS_DOOR_BELL_RF (440)
-            cmd_status = {
-                "u": uid,
-                "hsrf": 440,
-                "sn": sn,
-                "turn": 1,
-                "type": 1,
-            }
-            # 3. Lệnh sự kiện cửa thông minh (DoorNumberCodeMQTT.on_bell_door = 11)
-            cmd_sdr = {
-                "sdr": 11,
-                "u": uid,
-                "src": 1,
-                "serial": sn,
-            }
             try:
+                await self.coordinator.async_control_device(hub, cmd_pair)
                 await self.coordinator.async_control_device(hub, cmd_chime)
-                await self.coordinator.async_control_device(hub, cmd_status)
-                await self.coordinator.async_control_device(hub, cmd_sdr)
-                _LOGGER.info("Đã kích hoạt reo chuông tới loa RF %s (%s) cho sn=%s", hub.get("name"), hub.get("root_id"), sn)
+                _LOGGER.info("Đã kích hoạt reo chuông mức lớn nhất tới loa RF %s (%s) cho sn=%s", hub.get("name"), hub.get("root_id"), sn)
             except Exception as ex:
                 _LOGGER.warning("Lỗi kích hoạt chuông trên %s: %s", hub.get("name"), ex)
+
+        # Cập nhật trạng thái reo chuông vào coordinator để automation trên HA bắt được
+        doorbell_rid = f"HUN{sn}RF"
+        child_dev_id = str(self._device.get("id", ""))
+        self.coordinator._device_state.setdefault(doorbell_rid, {})["turn"] = 1
+        if child_dev_id:
+            self.coordinator._device_state.setdefault(child_dev_id, {})["turn"] = 1
+        self.coordinator.async_set_updated_data(self.coordinator.data)
+
+        async def _reset_turn():
+            await asyncio.sleep(2.5)
+            if doorbell_rid in self.coordinator._device_state:
+                self.coordinator._device_state[doorbell_rid]["turn"] = 0
+            if child_dev_id and child_dev_id in self.coordinator._device_state:
+                self.coordinator._device_state[child_dev_id]["turn"] = 0
+            self.coordinator.async_set_updated_data(self.coordinator.data)
+
+        self.hass.async_create_task(_reset_turn())
 
 
 class HunonicIRFanActionButton(CoordinatorEntity[HunonicCoordinator], ButtonEntity):
