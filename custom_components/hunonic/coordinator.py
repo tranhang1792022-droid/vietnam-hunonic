@@ -530,6 +530,53 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._device_state[dev_id].update(state)
 
             self._record_channel_state(root_id, state)
+
+            # Đồng bộ sự kiện bấm chuông cửa RF (hsrf: 440) về entity Chuông cửa
+            if state.get("hsrf") == 440 or ("sn" in state and str(state.get("type")) == "5"):
+                sn_val = state.get("sn")
+                if sn_val:
+                    child_rid = f"HUN{sn_val}RF"
+                    self._device_state.setdefault(child_rid, {})["turn"] = 1
+                    for d in (self.data or {}).get("devices", []):
+                        if str(d.get("root_id")) == child_rid:
+                            did = str(d.get("id", ""))
+                            if did:
+                                self._device_state.setdefault(did, {})["turn"] = 1
+                        # Forward lệnh reo chuông mức lớn nhất tới các loa chuông khác trong nhà
+                        if str(d.get("root_type", "")).lower() in ("hsrf", "hsrfv2") and str(d.get("root_id")) != root_id:
+                            fwd_cmd = {
+                                "u": self.get_device_uid(d),
+                                "hsrf": 460,
+                                "sn": int(sn_val),
+                                "type": 5,
+                                "volume": 15,
+                                "music": 1,
+                                "led": 1,
+                            }
+                            if self._mqtt_loop:
+                                self._mqtt_loop.call_soon_threadsafe(
+                                    lambda target_dev=d, cmd=fwd_cmd: self.hass.async_create_task(
+                                        self.async_control_device(target_dev, cmd)
+                                    )
+                                )
+
+                    # Tự động reset turn về 0 sau 2.5s
+                    async def _reset_doorbell_state(c_rid=child_rid, s_val=sn_val):
+                        await asyncio.sleep(2.5)
+                        if c_rid in self._device_state:
+                            self._device_state[c_rid]["turn"] = 0
+                        for d in (self.data or {}).get("devices", []):
+                            if str(d.get("root_id")) == c_rid:
+                                did = str(d.get("id", ""))
+                                if did and did in self._device_state:
+                                    self._device_state[did]["turn"] = 0
+                        self.async_set_updated_data(self.data)
+
+                    if self._mqtt_loop:
+                        self._mqtt_loop.call_soon_threadsafe(
+                            lambda: self.hass.async_create_task(_reset_doorbell_state())
+                        )
+
             _LOGGER.debug("MQTT update root_id=%s state=%s", root_id, state)
             if self._mqtt_loop and self.data:
                 # Thông báo HA cập nhật tất cả entities (thread-safe)
