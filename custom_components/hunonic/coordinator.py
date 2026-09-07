@@ -114,6 +114,8 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Thời điểm (monotonic) lần cuối re-resolve broker — throttle auto-tracking.
         self._last_broker_resolve = 0.0
         self._broker_reresolve_interval = 600  # 10 phút: dò server/thiết bị mới
+        # Thời điểm (monotonic) lần cuối reo chuông cửa — chống lặp chuông / echo từ MQTT
+        self._last_doorbell_ring_time = 0.0
 
     # ── DataUpdateCoordinator ────────────────────────────────────────────────
 
@@ -542,23 +544,38 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             did = str(d.get("id", ""))
                             if did:
                                 self._device_state.setdefault(did, {})["turn"] = 1
-                        # Forward lệnh reo chuông mức lớn nhất tới các loa chuông khác trong nhà
-                        if str(d.get("root_type", "")).lower() in ("hsrf", "hsrfv2") and str(d.get("root_id")) != root_id:
-                            fwd_cmd = {
-                                "u": self.get_device_uid(d),
-                                "hsrf": 460,
-                                "sn": int(sn_val),
-                                "type": 5,
-                                "volume": 15,
-                                "music": 1,
-                                "led": 1,
-                            }
-                            if self._mqtt_loop:
-                                self._mqtt_loop.call_soon_threadsafe(
-                                    lambda target_dev=d, cmd=fwd_cmd: self.hass.async_create_task(
-                                        self.async_control_device(target_dev, cmd)
+
+                    # Debounce 3.0s: Tránh lặp chuông / echo khi broker gửi ngược lại trạng thái vừa publish
+                    now_ts = time.monotonic()
+                    if now_ts - self._last_doorbell_ring_time >= 3.0:
+                        self._last_doorbell_ring_time = now_ts
+
+                        # 1. Forward lệnh reo chuông mức lớn nhất tới các loa chuông khác trong nhà
+                        for d in (self.data or {}).get("devices", []):
+                            if str(d.get("root_type", "")).lower() in ("hsrf", "hsrfv2") and str(d.get("root_id")) != root_id:
+                                fwd_cmd = {
+                                    "u": self.get_device_uid(d),
+                                    "hsrf": 460,
+                                    "sn": int(sn_val),
+                                    "type": 5,
+                                    "volume": 15,
+                                    "music": 1,
+                                    "led": 1,
+                                }
+                                if self._mqtt_loop:
+                                    self._mqtt_loop.call_soon_threadsafe(
+                                        lambda target_dev=d, cmd=fwd_cmd: self.hass.async_create_task(
+                                            self.async_control_device(target_dev, cmd)
+                                        )
                                     )
+
+                        # 2. Kích hoạt chuông reo & thông báo tới ứng dụng điện thoại
+                        if self._mqtt_loop:
+                            self._mqtt_loop.call_soon_threadsafe(
+                                lambda s_num=sn_val: self.hass.async_create_task(
+                                    self.async_notify_doorbell_ring(s_num)
                                 )
+                            )
 
                     # Tự động reset turn về 0 sau 2.5s
                     async def _reset_doorbell_state(c_rid=child_rid, s_val=sn_val):
@@ -821,6 +838,182 @@ class HunonicCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             lambda: self.hass.async_create_task(self.async_request_refresh()),
         )
         return False
+
+    async def async_publish_status(
+        self,
+        device: dict[str, Any],
+        payload: dict[str, Any],
+        topic_override: str | None = None,
+        publish_to_all_brokers: bool = True,
+    ) -> bool:
+        """Publish trạng thái thiết bị lên topicpub (/ok) của thiết bị.
+
+        Dùng để mô phỏng sự kiện từ phần cứng (ví dụ: chuông cửa reo hsrf: 440)
+        để App Hunonic trên điện thoại và Hunonic cloud nhận được và reo chuông / đẩy push notification.
+        """
+        root_id: str = str(device.get("root_id", ""))
+        root_type: str = str(device.get("root_type", ""))
+
+        raw_key = device.get("key")
+        raw_iv = device.get("iv")
+
+        topic = topic_override or str(device.get("topicpub") or device.get("topic_pub") or "").strip()
+        if not topic or topic.lower() == "none":
+            sub = str(device.get("topicsub") or device.get("topic_sub") or "").strip()
+            if sub and sub.lower() != "none":
+                topic = f"{sub}/ok" if not sub.endswith("/ok") else sub
+
+        # Nếu thiết bị là child (rfdb, rfchild, irchildv2...) hoặc key/iv không đủ độ dài -> dùng hub cha
+        if root_type in ("rfchild", "rfdb", "irchildv2", "irremote") or not raw_key or not raw_iv:
+            hub = self.find_parent_hub(device)
+            if hub:
+                hub_pub = str(hub.get("topicpub") or hub.get("topic_pub") or "").strip()
+                if not hub_pub or hub_pub.lower() == "none":
+                    hub_sub = str(hub.get("topicsub") or hub.get("topic_sub") or "").strip()
+                    if hub_sub and hub_sub.lower() != "none":
+                        hub_pub = f"{hub_sub}/ok" if not hub_sub.endswith("/ok") else hub_sub
+                if hub_pub:
+                    topic = hub_pub
+                hk = str(hub.get("key") or "").strip()
+                if hk and hk.lower() != "none":
+                    raw_key = hk
+                hi = str(hub.get("iv") or "").strip()
+                if hi and hi.lower() != "none":
+                    raw_iv = hi
+                hub_rid = str(hub.get("root_id") or "").strip()
+                if hub_rid and hub_rid.lower() != "none":
+                    root_id = hub_rid
+
+        if not topic:
+            _LOGGER.warning("Không tìm thấy topicpub để publish status cho %s", device.get("name"))
+            return False
+
+        if not topic.endswith("/ok"):
+            topic = f"{topic}/ok"
+
+        key_b64 = str(raw_key).strip() if raw_key else ""
+        iv_b64 = str(raw_iv).strip() if raw_iv else ""
+
+        # Fallback tìm key/iv từ hub có root_id trong topic
+        parts = topic.split("/")
+        valid_k = False
+        if key_b64 and iv_b64:
+            try:
+                if len(base64.b64decode(key_b64)) in (16, 24, 32) and len(base64.b64decode(iv_b64)) == 16:
+                    valid_k = True
+            except Exception:
+                valid_k = False
+
+        if not valid_k and len(parts) >= 3:
+            topic_hub_rid = parts[2]
+            for d in (self.data or {}).get("devices", []):
+                if str(d.get("root_id")) == topic_hub_rid and d.get("key") and d.get("iv"):
+                    try:
+                        kb = base64.b64decode(str(d.get("key")).strip())
+                        ib = base64.b64decode(str(d.get("iv")).strip())
+                        if len(kb) in (16, 24, 32) and len(ib) == 16:
+                            key_b64 = str(d.get("key")).strip()
+                            iv_b64 = str(d.get("iv")).strip()
+                            root_id = topic_hub_rid
+                            valid_k = True
+                            break
+                    except Exception:
+                        pass
+
+        # Đảm bảo u
+        if "u" not in payload or not payload["u"]:
+            payload["u"] = self.get_device_uid(device)
+
+        raw_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        try:
+            if valid_k:
+                payload_bytes = encrypt_bytes_with_keyiv(raw_json, key_b64, iv_b64)
+            else:
+                payload_bytes = encrypt_bytes_payload(raw_json, root_id)
+        except Exception as exc:
+            _LOGGER.error("Lỗi mã hóa status payload cho %s: %s", device.get("name"), exc)
+            return False
+
+        ok = False
+        target_clients = list(self._mqtt_clients.values()) if publish_to_all_brokers else []
+        if not target_clients:
+            target_clients = [c for c in self._mqtt_clients.values() if c.is_connected()]
+
+        for client in target_clients:
+            if client and client.is_connected():
+                res = client.publish(topic, payload_bytes, qos=1)
+                if res.rc == paho.MQTT_ERR_SUCCESS:
+                    ok = True
+
+        if ok:
+            _LOGGER.info("Đã publish status lên topicpub %s: %s", topic, raw_json)
+        else:
+            _LOGGER.warning("Publish status lên %s thất bại", topic)
+        return ok
+
+    async def async_notify_doorbell_ring(self, sn: int | str | None = None) -> None:
+        """Gửi thông báo và kích hoạt chuông reo trên toàn bộ ứng dụng điện thoại (HA Companion & Mobile)."""
+        sn_str = str(sn) if sn else "347607"
+        dev_name = "Chuông cửa"
+        for d in (self.data or {}).get("devices", []):
+            if sn_str in str(d.get("root_id", "")) or str(d.get("root_type", "")).lower() in ("rfdb", "rfbell"):
+                dev_name = str(d.get("name", "Chuông cửa"))
+                break
+
+        title = "🔔 Chuông cửa đang reo!"
+        msg = f"Có khách bấm {dev_name} lúc {time.strftime('%H:%M:%S')}!"
+
+        # 1. Bắn event lên Home Assistant Event Bus để kích hoạt bất kỳ automation nào
+        self.hass.bus.async_fire(
+            "hunonic_doorbell_ring",
+            {
+                "name": dev_name,
+                "sn": sn,
+                "timestamp": time.time(),
+            },
+        )
+
+        # 2. Gửi notification có âm thanh chuông cửa khẩn cấp tới ứng dụng di động Home Assistant
+        data_payload = {
+            "title": title,
+            "message": msg,
+            "data": {
+                "tag": "hunonic_doorbell",
+                "group": "doorbell",
+                "importance": "high",
+                "priority": "high",
+                "ttl": 0,
+                # Kênh & icon cho Android (đẩy âm thanh chuông)
+                "channel": "Doorbell",
+                "notification_icon": "mdi:bell-ring",
+                "color": "#e74c3c",
+                # Âm thanh khẩn cấp cho iOS
+                "push": {
+                    "sound": {
+                        "name": "doorbell.caf",
+                        "critical": 1,
+                        "volume": 1.0,
+                    },
+                    "interruption-level": "time-sensitive",
+                },
+            },
+        }
+
+        # Tìm toàn bộ service mobile_app trong Home Assistant
+        all_notify_services = self.hass.services.async_services().get("notify", {})
+        mobile_services = [s for s in all_notify_services if s.startswith("mobile_app_")]
+
+        for s in mobile_services:
+            try:
+                await self.hass.services.async_call("notify", s, data_payload, blocking=False)
+                _LOGGER.info("Hunonic: Đã gửi chuông thông báo tới điện thoại qua notify.%s", s)
+            except Exception as ex:
+                _LOGGER.debug("Lỗi gửi notify.%s: %s", s, ex)
+
+        try:
+            await self.hass.services.async_call("notify", "notify", data_payload, blocking=False)
+        except Exception as ex:
+            _LOGGER.debug("Fallback notify.notify: %s", ex)
 
     # ── State helpers ─────────────────────────────────────────────────────────
 
